@@ -8,14 +8,19 @@
 #include "BLI_path_utils.hh"
 
 #include "DNA_image_types.h"
+#include "DNA_material_types.h"
 #include "DNA_mesh_types.h"
 #include "DNA_meshdata_types.h"
+#include "DNA_object_types.h"
 #include "DNA_packedFile_types.h"
+#include "DNA_scene_types.h"
 
 #include "BKE_attribute.hh"
+#include "BKE_collection.hh"
 #include "BKE_context.hh"
 #include "BKE_image.hh"
 #include "BKE_main.hh"
+#include "BKE_material.hh"
 #include "BKE_mesh.hh"
 
 #include "IMB_imbuf.hh"
@@ -50,6 +55,40 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
             printf("No Main database available\n");
             return;
         }
+    }
+
+    // ===============================================================================================
+    // ===============================================================================================
+    // Validate .blend file
+    // ===============================================================================================
+    // ===============================================================================================
+    {
+        printf("[zachary] Validating .blend file...\n");
+        bool validation_passed = true;
+
+        // Check that every mesh has all material slots populated
+        LISTBASE_FOREACH(Mesh*, mesh, &bmain->meshes)
+        {
+            if (mesh->totcol > 0 && mesh->mat != nullptr)
+            {
+                for (int i = 0; i < mesh->totcol; i++)
+                {
+                    if (mesh->mat[i] == nullptr)
+                    {
+                        printf("[zachary] VALIDATION ERROR: Mesh %s has empty material slot at index %d (total slots: %d)\n", mesh->id.name, i, mesh->totcol);
+                        validation_passed = false;
+                    }
+                }
+            }
+        }
+
+        if (!validation_passed)
+        {
+            printf("[zachary] VALIDATION FAILED: Some meshes have empty material slots. Aborting export.\n");
+            return;
+        }
+
+        printf("[zachary] Validation passed: All mesh material slots are populated.\n");
     }
 
     // ===============================================================================================
@@ -226,6 +265,147 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
 
     // ===============================================================================================
     // ===============================================================================================
+    // Extract scene data
+    // ===============================================================================================
+    // ===============================================================================================
+    BBArchiveScene* scenes = nullptr;
+    int scene_count        = 0;
+    {
+        // Count scenes and mesh objects per scene
+        int total_scenes = BLI_listbase_count(&bmain->scenes);
+        printf("[zachary] Found %d scenes\n", total_scenes);
+
+        if (total_scenes > 0)
+        {
+            // First pass: count mesh objects per scene
+            std::vector<int> mesh_object_counts(total_scenes, 0);
+            int scene_idx = 0;
+            LISTBASE_FOREACH(Scene*, scene, &bmain->scenes)
+            {
+                FOREACH_SCENE_OBJECT_BEGIN(scene, ob)
+                {
+                    if (ob->type == OB_MESH && ob->data != nullptr)
+                    {
+                        mesh_object_counts[scene_idx]++;
+                    }
+                }
+                FOREACH_SCENE_OBJECT_END;
+                scene_idx++;
+            }
+
+            // Count total scenes with mesh objects
+            int scenes_with_objects = 0;
+            for (int count : mesh_object_counts)
+            {
+                if (count > 0)
+                {
+                    scenes_with_objects++;
+                }
+            }
+
+            printf("[zachary] Found %d scenes with mesh objects\n", scenes_with_objects);
+
+            if (scenes_with_objects > 0)
+            {
+                // Allocate scenes array
+                scenes               = (BBArchiveScene*)arena_alloc_z(arena, sizeof(BBArchiveScene) * scenes_with_objects)->data;
+
+                scene_idx            = 0;
+                int output_scene_idx = 0;
+                LISTBASE_FOREACH(Scene*, scene, &bmain->scenes)
+                {
+                    int mesh_object_count = mesh_object_counts[scene_idx];
+                    if (mesh_object_count == 0)
+                    {
+                        scene_idx++;
+                        continue;
+                    }
+
+                    printf("[zachary] Processing scene: %s (%d mesh objects)\n", scene->id.name, mesh_object_count);
+
+                    // Allocate scene elements
+                    BBArchiveSceneElem* elems = (BBArchiveSceneElem*)arena_alloc_z(arena, sizeof(BBArchiveSceneElem) * mesh_object_count)->data;
+
+                    int elem_idx              = 0;
+                    FOREACH_SCENE_OBJECT_BEGIN(scene, ob)
+                    {
+                        if (ob->type != OB_MESH || ob->data == nullptr)
+                        {
+                            continue;
+                        }
+
+                        Mesh* mesh = (Mesh*)ob->data;
+                        printf("[zachary]   Processing object: %s (mesh: %s)\n", ob->id.name, mesh->id.name);
+
+                        // Extract transform
+                        float pos[3]  = {ob->loc[0], ob->loc[1], ob->loc[2]};
+                        float rot[3]  = {ob->rot[0], ob->rot[1], ob->rot[2]};
+                        float sca[3]  = {ob->scale[0], ob->scale[1], ob->scale[2]};
+
+                        // Extract material names
+                        int mat_count = 0;
+                        for (int i = 0; i < ob->totcol; i++)
+                        {
+                            Material* mat = BKE_object_material_get(ob, i + 1);
+                            if (mat != nullptr)
+                            {
+                                mat_count++;
+                            }
+                        }
+
+                        const char** mat_names = nullptr;
+                        if (mat_count > 0)
+                        {
+                            mat_names   = (const char**)arena_alloc_z(arena, sizeof(const char*) * mat_count)->data;
+                            int mat_idx = 0;
+                            for (int i = 0; i < ob->totcol; i++)
+                            {
+                                Material* mat = BKE_object_material_get(ob, i + 1);
+                                if (mat != nullptr)
+                                {
+                                    mat_names[mat_idx] = mat->id.name;
+                                    mat_idx++;
+                                }
+                            }
+                        }
+
+                        // Create scene element
+                        BBArchiveSceneElem& elem = elems[elem_idx];
+                        elem.mesh_name           = mesh->id.name;
+                        elem.pos[0]              = pos[0];
+                        elem.pos[1]              = pos[1];
+                        elem.pos[2]              = pos[2];
+                        elem.rot[0]              = rot[0];
+                        elem.rot[1]              = rot[1];
+                        elem.rot[2]              = rot[2];
+                        elem.sca[0]              = sca[0];
+                        elem.sca[1]              = sca[1];
+                        elem.sca[2]              = sca[2];
+                        elem.mat_count           = mat_count;
+                        elem.mat_names           = mat_names;
+
+                        elem_idx++;
+                    }
+                    FOREACH_SCENE_OBJECT_END;
+
+                    // Create scene
+                    scenes[output_scene_idx].scene_name = scene->id.name;
+                    scenes[output_scene_idx].elem_count = mesh_object_count;
+                    scenes[output_scene_idx].elems      = elems;
+
+                    printf("[zachary] Created scene: %s with %u elements\n", scenes[output_scene_idx].scene_name, scenes[output_scene_idx].elem_count);
+
+                    output_scene_idx++;
+                    scene_idx++;
+                }
+
+                scene_count = scenes_with_objects;
+            }
+        }
+    }
+
+    // ===============================================================================================
+    // ===============================================================================================
     // Extract meshes and write to bb_archive
     // ===============================================================================================
     // ===============================================================================================
@@ -236,13 +416,13 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
         info.skeleton_count     = 0;
         info.animation_count    = 0;
         info.shader_graph_count = 0;
-        info.scene_count        = 0;
+        info.scene_count        = scene_count;
         info.meshes             = meshes;
         info.images             = nullptr;
         info.skeletons          = nullptr;
         info.animations         = nullptr;
         info.shader_graphs      = nullptr;
-        info.scenes             = nullptr;
+        info.scenes             = scenes;
 
         bb_archive_write(&info, bb_archive_output_dir);
         printf("[zachary] bb_archive_write completed\n");
