@@ -23,6 +23,8 @@ set(LIB
   PRIVATE bf::sequencer
   PRIVATE bf::windowmanager
   PRIVATE bf::dependencies::optional::opencolorio
+  PRIVATE bf::extern::zp_c
+  PRIVATE bf::extern::bb_archive
 )
 
 if(HAVE_FEENABLEEXCEPT)
@@ -139,6 +141,7 @@ set(SRC
   creator.cc
   creator_args.cc
   creator_signals.cc
+  zachary.cc
 
   creator_intern.h
 )

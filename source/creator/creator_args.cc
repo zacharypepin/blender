@@ -75,6 +75,8 @@
 
 #  include "creator_intern.h" /* Own include. */
 
+#  include "zachary.h"
+
 /* -------------------------------------------------------------------- */
 /** \name Build Defines
  * \{ */
@@ -2723,6 +2725,21 @@ static int arg_handle_profile_gpu_set(int /*argc*/, const char ** /*argv*/, void
   return 0;
 }
 
+static const char arg_handle_bb_archive_output_dir_set_doc[] =
+    "<path>\n"
+    "\tSet the output directory for bb archive files and run zachary_main.";
+static int arg_handle_bb_archive_output_dir_set(int argc, const char **argv, void *data)
+{
+  bContext *C = static_cast<bContext *>(data);
+  if (argc > 1) {
+    zachary_main(C, argv[1]);
+    WM_exit(C, G.is_break ? EXIT_FAILURE : EXIT_SUCCESS);
+    return 1;
+  }
+  fprintf(stderr, "\nError: you must specify a path after '--bb-archive-output-dir'.\n");
+  return 0;
+}
+
 /**
  * Implementation for #arg_handle_load_last_file, also used by `--open-last`.
  * \return true on success.
@@ -3143,6 +3160,8 @@ void main_args_setup(bContext *C, bArgs *ba, bool all)
   BLI_args_add(ba, nullptr, "--python-console", CB(arg_handle_python_console_run), C);
   BLI_args_add(ba, nullptr, "--python-exit-code", CB(arg_handle_python_exit_code_set), nullptr);
   BLI_args_add(ba, nullptr, "--addons", CB(arg_handle_addons_set), C);
+
+  BLI_args_add(ba, nullptr, "--bb-archive-output-dir", CB(arg_handle_bb_archive_output_dir_set), C);
 
   BLI_args_add(ba, "-o", "--render-output", CB(arg_handle_output_set), C);
   BLI_args_add(ba, "-E", "--engine", CB(arg_handle_engine_set), C);
