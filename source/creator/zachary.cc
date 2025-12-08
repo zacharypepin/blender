@@ -5,7 +5,6 @@
 
 #include "BLI_listbase.h"
 #include "BLI_math_vector_types.hh"
-#include "BLI_path_utils.hh"
 
 #include "DNA_image_types.h"
 #include "DNA_material_types.h"
@@ -23,8 +22,8 @@
 #include "BKE_material.hh"
 #include "BKE_mesh.hh"
 
+#include "IMB_colormanagement.hh"
 #include "IMB_imbuf.hh"
-#include "IMB_imbuf_enums.h"
 
 #include "bb_archive/bb_archive.h"
 #include "zp_c/arena.h"
@@ -425,19 +424,123 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
 
     // ===============================================================================================
     // ===============================================================================================
+    // Extract images for bb_archive
+    // ===============================================================================================
+    // ===============================================================================================
+    BBArchiveImage* images = nullptr;
+    int image_count        = 0;
+    {
+        int total_image_count = 0;
+        LISTBASE_FOREACH(Image*, ima, &bmain->images)
+        {
+            if (!BKE_image_has_packedfile(ima))
+            {
+                continue;
+            }
+
+            LISTBASE_FOREACH(ImagePackedFile*, imapf, &ima->packedfiles)
+            {
+                if (imapf->packedfile == nullptr)
+                {
+                    continue;
+                }
+                total_image_count++;
+            }
+        }
+
+        printf("[zachary] Found %d packed images\n", total_image_count);
+
+        if (total_image_count > 0)
+        {
+            images        = (BBArchiveImage*)arena_alloc_z(arena, sizeof(BBArchiveImage) * total_image_count)->data;
+
+            int image_idx = 0;
+            LISTBASE_FOREACH(Image*, ima, &bmain->images)
+            {
+                if (!BKE_image_has_packedfile(ima))
+                {
+                    continue;
+                }
+
+                LISTBASE_FOREACH(ImagePackedFile*, imapf, &ima->packedfiles)
+                {
+                    if (imapf->packedfile == nullptr)
+                    {
+                        continue;
+                    }
+
+                    int flag    = IB_byte_data | IB_metadata;
+                    ImBuf* ibuf = IMB_load_image_from_memory((const unsigned char*)imapf->packedfile->data, imapf->packedfile->size, flag, "<packed data>", nullptr, ima->colorspace_settings.name);
+
+                    if (ibuf == nullptr)
+                    {
+                        continue;
+                    }
+
+                    // Ensure byte buffer exists (convert from float if needed)
+                    if (ibuf->byte_buffer.data == nullptr && ibuf->float_buffer.data != nullptr)
+                    {
+                        if (!IMB_alloc_byte_pixels(ibuf, false))
+                        {
+                            IMB_freeImBuf(ibuf);
+                            continue;
+                        }
+                        IMB_byte_from_float(ibuf);
+                    }
+
+                    if (ibuf->byte_buffer.data == nullptr)
+                    {
+                        IMB_freeImBuf(ibuf);
+                        continue;
+                    }
+
+                    // Extract rgba8 data
+                    size_t pixel_count = IMB_get_pixel_count(ibuf);
+                    size_t blob_size   = pixel_count * 4;
+                    uint8_t* blob_data = (uint8_t*)arena_alloc_z(arena, blob_size)->data;
+                    memcpy(blob_data, ibuf->byte_buffer.data, blob_size);
+
+                    char image_name[256];
+                    snprintf(image_name, sizeof(image_name), "%s_%d", ima->id.name, imapf->tile_number);
+
+                    // Create BBArchiveImage
+                    BBArchiveImage& bb_image  = images[image_idx];
+                    bb_image.image_name       = arena_strdup_z(arena, image_name);
+                    bb_image.width            = ibuf->x;
+                    bb_image.height           = ibuf->y;
+                    bb_image.num_channels     = 4;
+                    bb_image.bits_per_channel = 8;
+                    bb_image.is_srgb          = IMB_colormanagement_space_is_srgb(ibuf->byte_buffer.colorspace);
+                    bb_image.mip_levels       = 1;
+                    bb_image.blob             = blob_data;
+                    bb_image.blob_size        = blob_size;
+
+                    printf("[zachary] Extracted rgba8 image: %s (%ux%u, %zu bytes)\n", bb_image.image_name, bb_image.width, bb_image.height, blob_size);
+
+                    IMB_freeImBuf(ibuf);
+                    image_idx++;
+                }
+            }
+
+            image_count = image_idx;
+        }
+    }
+
+    // ===============================================================================================
+    // ===============================================================================================
     // Extract meshes and write to bb_archive
     // ===============================================================================================
     // ===============================================================================================
     {
         BBArchiveInfo info      = {0};
         info.mesh_count         = mesh_count;
-        info.image_count        = 0;
+        info.image_count        = image_count;
         info.skeleton_count     = 0;
         info.animation_count    = 0;
         info.shader_graph_count = 0;
         info.scene_count        = scene_count;
         info.meshes             = meshes;
-        info.images             = nullptr;
+        info.images             = images;
         info.skeletons          = nullptr;
         info.animations         = nullptr;
         info.shader_graphs      = nullptr;
@@ -484,54 +587,6 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 printf("[zachary]   - %s\n", replace_me_prefix(arena, mesh_name));
             }
             printf("[zachary] Total invalid meshes: %d\n", (int)invalid_mesh_names.size());
-        }
-    }
-
-    // ===============================================================================================
-    // ===============================================================================================
-    // write images to png
-    // ===============================================================================================
-    // ===============================================================================================
-    {
-        int image_count = 0;
-        LISTBASE_FOREACH(Image*, ima, &bmain->images)
-        {
-            if (!BKE_image_has_packedfile(ima))
-            {
-                continue;
-            }
-
-            LISTBASE_FOREACH(ImagePackedFile*, imapf, &ima->packedfiles)
-            {
-                if (imapf->packedfile == nullptr)
-                {
-                    continue;
-                }
-
-                int flag    = IB_byte_data | IB_metadata;
-                ImBuf* ibuf = IMB_load_image_from_memory((const unsigned char*)imapf->packedfile->data, imapf->packedfile->size, flag, "<packed data>", nullptr, ima->colorspace_settings.name);
-
-                if (ibuf == nullptr)
-                {
-                    continue;
-                }
-
-                ibuf->ftype            = IMB_FTYPE_PNG;
-                ibuf->foptions.quality = 100;
-
-                char filepath[FILE_MAX];
-                snprintf(filepath, sizeof(filepath), "./image_%d_%d.png", image_count, imapf->tile_number);
-
-                BLI_path_abs_from_cwd(filepath, sizeof(filepath));
-
-                if (IMB_save_image(ibuf, filepath, 0))
-                {
-                    printf("Saved packed image to %s\n", filepath);
-                }
-
-                IMB_freeImBuf(ibuf);
-            }
-            image_count++;
         }
     }
 
