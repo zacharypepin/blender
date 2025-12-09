@@ -14,6 +14,7 @@
 #include "DNA_material_types.h"
 #include "DNA_mesh_types.h"
 #include "DNA_meshdata_types.h"
+#include "DNA_node_types.h"
 #include "DNA_object_types.h"
 #include "DNA_packedFile_types.h"
 #include "DNA_scene_types.h"
@@ -104,10 +105,39 @@ namespace
         bool is_srgb;
     };
 
+    struct shader_node_socket_t
+    {
+        std::string identifier;
+        std::string idname; // e.g. "NodeSocketColor", "NodeSocketFloat"
+    };
+
+    struct shader_node_t
+    {
+        std::string idname; // e.g. "ShaderNodeTexImage", "ShaderNodeBsdfPrincipled"
+        std::vector<shader_node_socket_t> inputs;
+        std::vector<shader_node_socket_t> outputs;
+    };
+
+    struct shader_link_t
+    {
+        std::string from_node;
+        std::string from_socket;
+        std::string to_node;
+        std::string to_socket;
+    };
+
+    struct material_t
+    {
+        std::string name;
+        std::vector<shader_node_t> nodes;
+        std::vector<shader_link_t> links;
+    };
+
     struct data_t
     {
         std::vector<scene_t> scenes;
         std::vector<image_t> images;
+        std::vector<material_t> materials;
         std::vector<std::string> invalid_mesh_names;
     };
 }
@@ -412,6 +442,58 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 data.images.push_back(std::move(image));
             }
         }
+
+        // materials
+        LISTBASE_FOREACH(Material*, mat, &bmain->materials)
+        {
+            if (mat->nodetree == nullptr) continue;
+
+            material_t material_data;
+            material_data.name = replace_prefix(mat->id.name, "MA", "mat_");
+
+            // Iterate through all nodes in the shader graph
+            LISTBASE_FOREACH(bNode*, node, &mat->nodetree->nodes)
+            {
+                shader_node_t node_data;
+                node_data.idname = node->idname;
+
+                // Input sockets
+                LISTBASE_FOREACH(bNodeSocket*, socket, &node->inputs)
+                {
+                    shader_node_socket_t socket_data;
+                    socket_data.identifier = socket->identifier;
+                    socket_data.idname     = socket->idname;
+                    node_data.inputs.push_back(socket_data);
+                }
+
+                // Output sockets
+                LISTBASE_FOREACH(bNodeSocket*, socket, &node->outputs)
+                {
+                    shader_node_socket_t socket_data;
+                    socket_data.identifier = socket->identifier;
+                    socket_data.idname     = socket->idname;
+                    node_data.outputs.push_back(socket_data);
+                }
+
+                material_data.nodes.push_back(node_data);
+            }
+
+            // Iterate through all links in the shader graph
+            LISTBASE_FOREACH(bNodeLink*, link, &mat->nodetree->links)
+            {
+                if (link->fromnode && link->tonode && link->fromsock && link->tosock)
+                {
+                    shader_link_t link_data;
+                    link_data.from_node   = link->fromnode->name;
+                    link_data.from_socket = link->fromsock->identifier;
+                    link_data.to_node     = link->tonode->name;
+                    link_data.to_socket   = link->tosock->identifier;
+                    material_data.links.push_back(link_data);
+                }
+            }
+
+            data.materials.push_back(material_data);
+        }
     }
 
     // ===============================================================================================
@@ -452,6 +534,38 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
         {
             const image_t& image = data.images[image_idx];
             fprintf(log_file, "[zachary]   Image[%zu]: %s (%ux%u, srgb=%d, size=%zu)\n", image_idx, image.name.c_str(), image.width, image.height, image.is_srgb, image.rgba_data.size());
+        }
+
+        fprintf(log_file, "[zachary] Material count: %zu\n", data.materials.size());
+        for (size_t mat_idx = 0; mat_idx < data.materials.size(); mat_idx++)
+        {
+            const material_t& mat = data.materials[mat_idx];
+            fprintf(log_file, "[zachary]   Material[%zu]: %s\n", mat_idx, mat.name.c_str());
+            fprintf(log_file, "[zachary]     Node count: %zu\n", mat.nodes.size());
+            for (size_t node_idx = 0; node_idx < mat.nodes.size(); node_idx++)
+            {
+                const shader_node_t& node = mat.nodes[node_idx];
+                fprintf(log_file, "[zachary]       Node[%zu]: idname=\"%s\"\n", node_idx, node.idname.c_str());
+                fprintf(log_file, "[zachary]         Inputs (%zu):", node.inputs.size());
+                for (const auto& sock : node.inputs)
+                {
+                    fprintf(log_file, " %s (%s)", sock.identifier.c_str(), sock.idname.c_str());
+                }
+                fprintf(log_file, "\n");
+                fprintf(log_file, "[zachary]         Outputs (%zu):", node.outputs.size());
+                for (const auto& sock : node.outputs)
+                {
+                    fprintf(log_file, " %s (%s)", sock.identifier.c_str(), sock.idname.c_str());
+                }
+                fprintf(log_file, "\n");
+            }
+
+            fprintf(log_file, "[zachary]     Link count: %zu\n", mat.links.size());
+            for (size_t link_idx = 0; link_idx < mat.links.size(); link_idx++)
+            {
+                const shader_link_t& link = mat.links[link_idx];
+                fprintf(log_file, "[zachary]       Link[%zu]: %s.%s -> %s.%s\n", link_idx, link.from_node.c_str(), link.from_socket.c_str(), link.to_node.c_str(), link.to_socket.c_str());
+            }
         }
 
         if (!data.invalid_mesh_names.empty())
