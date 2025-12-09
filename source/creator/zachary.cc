@@ -161,11 +161,42 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
     // ===============================================================================================
     // ===============================================================================================
     // ===============================================================================================
+    Main* bmain;
+    {
+        if ((bmain = CTX_data_main(C)) == nullptr)
+        {
+            fprintf(stderr, "[zachary] ERROR: No Main database available\n");
+            return;
+        }
+    }
+
+    // ===============================================================================================
+    // ===============================================================================================
+    // ===============================================================================================
+    // ===============================================================================================
     FILE* log_file;
     {
-        if ((log_file = fopen("./zachary_log.txt", "w")) == nullptr)
+        std::string log_filename;
+        if (bmain->filepath[0] != '\0')
         {
-            fprintf(stderr, "[zachary] Failed to open log file\n");
+            std::string filepath = bmain->filepath;
+            size_t last_slash    = filepath.find_last_of("/\\");
+            std::string basename = (last_slash != std::string::npos) ? filepath.substr(last_slash + 1) : filepath;
+            size_t dot_pos       = basename.rfind(".blend");
+            if (dot_pos != std::string::npos)
+            {
+                basename = basename.substr(0, dot_pos);
+            }
+            log_filename = basename + "_log.txt";
+        }
+        else
+        {
+            log_filename = "zachary_log.txt";
+        }
+
+        if ((log_file = fopen(log_filename.c_str(), "w")) == nullptr)
+        {
+            fprintf(stderr, "[zachary] Failed to open log file: %s\n", log_filename.c_str());
             return;
         }
     }
@@ -175,20 +206,6 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
     // ===============================================================================================
     // ===============================================================================================
     fprintf(log_file, "[zachary] zachary_main()\n");
-
-    // ===============================================================================================
-    // ===============================================================================================
-    // ===============================================================================================
-    // ===============================================================================================
-    Main* bmain;
-    {
-        if ((bmain = CTX_data_main(C)) == nullptr)
-        {
-            fprintf(stderr, "[zachary] ERROR: No Main database available\n");
-            fclose(log_file);
-            return;
-        }
-    }
 
     // ===============================================================================================
     // ===============================================================================================
