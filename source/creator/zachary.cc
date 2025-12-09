@@ -1,3 +1,5 @@
+#include "zachary.h"
+
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -29,7 +31,58 @@
 #include "bb_archive/bb_archive.h"
 #include "zp_c/arena.h"
 
-#include "zachary.h"
+#include <string>
+
+// =========================================================================================================================================
+// =========================================================================================================================================
+// =========================================================================================================================================
+// =========================================================================================================================================
+namespace
+{
+    struct vec3_t
+    {
+        float x;
+        float y;
+        float z;
+    };
+
+    struct triangle_t
+    {
+        vec3_t vertices[3];
+    };
+
+    struct submesh_t
+    {
+        std::string material_name;
+        std::vector<triangle_t> triangles;
+    };
+
+    struct mesh_t
+    {
+        std::string name;
+        std::vector<submesh_t> submeshes;
+    };
+
+    struct scene_elem_t
+    {
+        vec3_t pos;
+        vec3_t euler_rot;
+        vec3_t scale;
+        mesh_t mesh;
+    };
+
+    struct scene_t
+    {
+        std::string name;
+        std::vector<scene_elem_t> elems;
+    };
+
+    struct data_t
+    {
+        std::vector<scene_t> scenes;
+        std::vector<std::string> invalid_mesh_names;
+    };
+}
 
 // =========================================================================================================================================
 // =========================================================================================================================================
@@ -111,6 +164,114 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
         {
             printf("No Main database available\n");
             return;
+        }
+    }
+
+    // ===============================================================================================
+    // ===============================================================================================
+    // populate data_t
+    // ===============================================================================================
+    // ===============================================================================================
+    data_t data;
+    {
+        LISTBASE_FOREACH(Scene*, scene, &bmain->scenes)
+        {
+            scene_t scene_data;
+            scene_data.name = scene->id.name;
+
+            FOREACH_SCENE_OBJECT_BEGIN(scene, ob)
+            {
+                if (ob->type != OB_MESH || ob->data == nullptr) continue;
+
+                // Extract mesh geometry data
+                Mesh* mesh                                 = (Mesh*)ob->data;
+                blender::Span<blender::float3> positions   = mesh->vert_positions();
+                blender::Span<int> corner_verts            = mesh->corner_verts();
+                blender::Span<blender::int3> corner_tris   = mesh->corner_tris();
+                blender::Span<int> corner_tri_faces        = mesh->corner_tri_faces();
+                blender::bke::AttributeAccessor attributes = mesh->attributes();
+
+                // Check for empty material slots
+                {
+                    bool has_empty_material_slot = false;
+                    if (mesh->totcol > 0 && mesh->mat != nullptr)
+                    {
+                        for (int i = 0; i < mesh->totcol; i++)
+                        {
+                            if (mesh->mat[i] == nullptr)
+                            {
+                                has_empty_material_slot = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (has_empty_material_slot)
+                    {
+                        data.invalid_mesh_names.push_back(mesh->id.name);
+                        continue;
+                    }
+                }
+
+                scene_elem_t elem = {};
+                elem.pos.x        = ob->loc[0];
+                elem.pos.y        = ob->loc[1];
+                elem.pos.z        = ob->loc[2];
+                elem.euler_rot.x  = ob->rot[0];
+                elem.euler_rot.y  = ob->rot[1];
+                elem.euler_rot.z  = ob->rot[2];
+                elem.scale.x      = ob->scale[0];
+                elem.scale.y      = ob->scale[1];
+                elem.scale.z      = ob->scale[2];
+
+                elem.mesh.name    = mesh->id.name;
+
+                // Group triangles by material index
+                std::map<int, std::vector<int>> triangles_by_material;
+                {
+                    const blender::VArray<int> material_indices_varray = *attributes.lookup_or_default<int>("material_index", blender::bke::AttrDomain::Face, 0);
+                    blender::VArraySpan<int> material_indices(material_indices_varray);
+
+                    for (int tri_idx = 0; tri_idx < corner_tris.size(); tri_idx++)
+                    {
+                        int face_idx = corner_tri_faces[tri_idx];
+                        int mat_idx  = material_indices[face_idx];
+                        triangles_by_material[mat_idx].push_back(tri_idx);
+                    }
+                }
+
+                // Create submeshes from grouped triangles
+                for (const auto& [mat_idx, triangle_indices] : triangles_by_material)
+                {
+                    submesh_t submesh;
+
+                    Material* mat = BKE_object_material_get(ob, mat_idx + 1);
+                    if (mat != nullptr)
+                    {
+                        submesh.material_name = mat->id.name;
+                    }
+
+                    for (int tri_idx : triangle_indices)
+                    {
+                        blender::int3 tri = corner_tris[tri_idx];
+                        triangle_t triangle;
+                        for (int i = 0; i < 3; i++)
+                        {
+                            int corner             = tri[i];
+                            int vert_idx           = corner_verts[corner];
+                            triangle.vertices[i].x = positions[vert_idx].x;
+                            triangle.vertices[i].y = positions[vert_idx].y;
+                            triangle.vertices[i].z = positions[vert_idx].z;
+                        }
+                        submesh.triangles.push_back(triangle);
+                    }
+                    elem.mesh.submeshes.push_back(submesh);
+                }
+
+                scene_data.elems.push_back(elem);
+            }
+            FOREACH_SCENE_OBJECT_END;
+
+            data.scenes.push_back(scene_data);
         }
     }
 
