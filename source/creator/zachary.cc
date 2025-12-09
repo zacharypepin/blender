@@ -1,5 +1,6 @@
 #include "zachary.h"
 
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -77,9 +78,18 @@ namespace
         std::vector<scene_elem_t> elems;
     };
 
+    struct image_t
+    {
+        std::string name;
+        std::string colourspace_name;
+        const void* packedfile_data;
+        uint64_t packedfile_size;
+    };
+
     struct data_t
     {
         std::vector<scene_t> scenes;
+        std::vector<image_t> images;
         std::vector<std::string> invalid_mesh_names;
     };
 }
@@ -187,6 +197,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
     // ===============================================================================================
     data_t data;
     {
+        // scenes
         LISTBASE_FOREACH(Scene*, scene, &bmain->scenes)
         {
             scene_t scene_data;
@@ -287,6 +298,30 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
 
             data.scenes.push_back(scene_data);
         }
+
+        // images
+        LISTBASE_FOREACH(Image*, ima, &bmain->images)
+        {
+            if (!BKE_image_has_packedfile(ima))
+            {
+                continue;
+            }
+
+            LISTBASE_FOREACH(ImagePackedFile*, imapf, &ima->packedfiles)
+            {
+                if (imapf->packedfile == nullptr)
+                {
+                    continue;
+                }
+
+                image_t image          = {};
+                image.name             = ima->id.name;
+                image.colourspace_name = ima->colorspace_settings.name;
+                image.packedfile_data  = imapf->packedfile->data;
+                image.packedfile_size  = imapf->packedfile->size;
+                data.images.push_back(image);
+            }
+        }
     }
 
     // ===============================================================================================
@@ -320,6 +355,13 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                     fprintf(log_file, "[zachary]             Submesh[%zu]: material=%s, triangles=%zu\n", submesh_idx, submesh.material_name.c_str(), submesh.triangles.size());
                 }
             }
+        }
+
+        fprintf(log_file, "[zachary] Image count: %zu\n", data.images.size());
+        for (size_t image_idx = 0; image_idx < data.images.size(); image_idx++)
+        {
+            const image_t& image = data.images[image_idx];
+            fprintf(log_file, "[zachary]   Image[%zu]: %s (colourspace=%s, size=%lu)\n", image_idx, image.name.c_str(), image.colourspace_name.c_str(), image.packedfile_size);
         }
 
         if (!data.invalid_mesh_names.empty())
@@ -548,82 +590,54 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
     // Extract scene data
     // ===============================================================================================
     // ===============================================================================================
-    BBArchiveScene* scenes = nullptr;
-    int scene_count        = 0;
+    BBArchiveScene* bb_scenes;
+    int scene_count;
     {
-        int total_scenes = BLI_listbase_count(&bmain->scenes);
-        fprintf(log_file, "[zachary] Found %d scenes\n", total_scenes);
+        fprintf(log_file, "[zachary] Found %zu scenes\n", data.scenes.size());
 
-        scenes        = (BBArchiveScene*)arena_alloc_z(arena, sizeof(BBArchiveScene) * total_scenes)->data;
+        bb_scenes = (BBArchiveScene*)arena_alloc_z(arena, sizeof(BBArchiveScene) * data.scenes.size())->data;
 
-        int scene_idx = 0;
-        LISTBASE_FOREACH(Scene*, scene, &bmain->scenes)
+        for (size_t scene_idx = 0; scene_idx < data.scenes.size(); scene_idx++)
         {
-            int mesh_object_count = 0;
-            FOREACH_SCENE_OBJECT_BEGIN(scene, ob)
+            const scene_t& scene = data.scenes[scene_idx];
+
+            fprintf(log_file, "[zachary] Processing scene: %s (%zu mesh objects)\n", scene.name.c_str(), scene.elems.size());
+
+            BBArchiveSceneElem* elems = (BBArchiveSceneElem*)arena_alloc_z(arena, sizeof(BBArchiveSceneElem) * scene.elems.size())->data;
+
+            for (size_t elem_idx = 0; elem_idx < scene.elems.size(); elem_idx++)
             {
-                if (ob->type == OB_MESH && ob->data != nullptr && valid_meshes.find((Mesh*)ob->data) != valid_meshes.end())
+                const scene_elem_t& src_elem = scene.elems[elem_idx];
+
+                int mat_count                = src_elem.mesh.submeshes.size();
+                const char** mat_names       = (const char**)arena_alloc_z(arena, sizeof(const char*) * mat_count)->data;
+                for (size_t i = 0; i < src_elem.mesh.submeshes.size(); i++)
                 {
-                    mesh_object_count++;
-                }
-            }
-            FOREACH_SCENE_OBJECT_END;
-
-            fprintf(log_file, "[zachary] Processing scene: %s (%d mesh objects)\n", scene->id.name, mesh_object_count);
-
-            BBArchiveSceneElem* elems = (BBArchiveSceneElem*)arena_alloc_z(arena, sizeof(BBArchiveSceneElem) * mesh_object_count)->data;
-            int elem_idx              = 0;
-
-            FOREACH_SCENE_OBJECT_BEGIN(scene, ob)
-            {
-                if (ob->type != OB_MESH || ob->data == nullptr) continue;
-
-                Mesh* mesh = (Mesh*)ob->data;
-                if (valid_meshes.find(mesh) == valid_meshes.end())
-                {
-                    fprintf(log_file, "[zachary]   Skipping object: %s (mesh: %s - invalid mesh)\n", ob->id.name, mesh->id.name);
-                    continue;
+                    mat_names[i] = replace_prefix(arena, src_elem.mesh.submeshes[i].material_name.c_str(), "MA", "mat_shad_");
                 }
 
-                fprintf(log_file, "[zachary]   Processing object: %s (mesh: %s)\n", ob->id.name, mesh->id.name);
-
-                int mat_count = 0;
-                for (int i = 0; i < ob->totcol; i++)
-                {
-                    if (BKE_object_material_get(ob, i + 1) != nullptr) mat_count++;
-                }
-
-                const char** mat_names = (const char**)arena_alloc_z(arena, sizeof(const char*) * mat_count)->data;
-                for (int i = 0, mat_idx = 0; i < ob->totcol; i++)
-                {
-                    Material* mat = BKE_object_material_get(ob, i + 1);
-                    if (mat != nullptr) mat_names[mat_idx++] = replace_prefix(arena, mat->id.name, "MA", "mat_shad_");
-                }
-
-                BBArchiveSceneElem& elem = elems[elem_idx++];
-                elem.mesh_name           = replace_prefix(arena, mesh->id.name, "ME", "mesh_");
-                elem.pos[0]              = ob->loc[0];
-                elem.pos[1]              = ob->loc[1];
-                elem.pos[2]              = ob->loc[2];
-                elem.rot[0]              = ob->rot[0];
-                elem.rot[1]              = ob->rot[1];
-                elem.rot[2]              = ob->rot[2];
-                elem.sca[0]              = ob->scale[0];
-                elem.sca[1]              = ob->scale[1];
-                elem.sca[2]              = ob->scale[2];
+                BBArchiveSceneElem& elem = elems[elem_idx];
+                elem.mesh_name           = replace_prefix(arena, src_elem.mesh.name.c_str(), "ME", "mesh_");
+                elem.pos[0]              = src_elem.pos.x;
+                elem.pos[1]              = src_elem.pos.y;
+                elem.pos[2]              = src_elem.pos.z;
+                elem.rot[0]              = src_elem.euler_rot.x;
+                elem.rot[1]              = src_elem.euler_rot.y;
+                elem.rot[2]              = src_elem.euler_rot.z;
+                elem.sca[0]              = src_elem.scale.x;
+                elem.sca[1]              = src_elem.scale.y;
+                elem.sca[2]              = src_elem.scale.z;
                 elem.mat_count           = mat_count;
                 elem.mat_names           = mat_names;
             }
-            FOREACH_SCENE_OBJECT_END;
 
-            scenes[scene_idx].scene_name = replace_prefix(arena, scene->id.name, "SC", "scene_");
-            scenes[scene_idx].elem_count = elem_idx;
-            scenes[scene_idx].elems      = elems;
-            fprintf(log_file, "[zachary] Created scene: %s with %u elements\n", scenes[scene_idx].scene_name, scenes[scene_idx].elem_count);
-            scene_idx++;
+            bb_scenes[scene_idx].scene_name = replace_prefix(arena, scene.name.c_str(), "SC", "scene_");
+            bb_scenes[scene_idx].elem_count = scene.elems.size();
+            bb_scenes[scene_idx].elems      = elems;
+            fprintf(log_file, "[zachary] Created scene: %s with %u elements\n", bb_scenes[scene_idx].scene_name, bb_scenes[scene_idx].elem_count);
         }
 
-        scene_count = total_scenes;
+        scene_count = data.scenes.size();
     }
 
     // ===============================================================================================
@@ -631,97 +645,63 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
     // Extract images for bb_archive
     // ===============================================================================================
     // ===============================================================================================
-    BBArchiveImage* images = nullptr;
-    int image_count        = 0;
+    BBArchiveImage* bb_images = nullptr;
+    int image_count           = 0;
     {
-        int total_image_count = 0;
-        LISTBASE_FOREACH(Image*, ima, &bmain->images)
-        {
-            if (!BKE_image_has_packedfile(ima))
-            {
-                continue;
-            }
+        fprintf(log_file, "[zachary] Found %zu packed images\n", data.images.size());
 
-            LISTBASE_FOREACH(ImagePackedFile*, imapf, &ima->packedfiles)
-            {
-                if (imapf->packedfile == nullptr)
-                {
-                    continue;
-                }
-                total_image_count++;
-            }
-        }
-
-        fprintf(log_file, "[zachary] Found %d packed images\n", total_image_count);
-
-        images        = (BBArchiveImage*)arena_alloc_z(arena, sizeof(BBArchiveImage) * total_image_count)->data;
+        bb_images     = (BBArchiveImage*)arena_alloc_z(arena, sizeof(BBArchiveImage) * data.images.size())->data;
 
         int image_idx = 0;
-        LISTBASE_FOREACH(Image*, ima, &bmain->images)
+        for (const image_t& image : data.images)
         {
-            if (!BKE_image_has_packedfile(ima))
+            int flag    = IB_byte_data | IB_metadata;
+            ImBuf* ibuf = IMB_load_image_from_memory((const unsigned char*)image.packedfile_data, image.packedfile_size, flag, "<packed data>", nullptr, (char*)image.colourspace_name.c_str());
+
+            if (ibuf == nullptr)
             {
                 continue;
             }
 
-            LISTBASE_FOREACH(ImagePackedFile*, imapf, &ima->packedfiles)
+            // Ensure byte buffer exists (convert from float if needed)
+            if (ibuf->byte_buffer.data == nullptr && ibuf->float_buffer.data != nullptr)
             {
-                if (imapf->packedfile == nullptr)
-                {
-                    continue;
-                }
-
-                int flag    = IB_byte_data | IB_metadata;
-                ImBuf* ibuf = IMB_load_image_from_memory((const unsigned char*)imapf->packedfile->data, imapf->packedfile->size, flag, "<packed data>", nullptr, ima->colorspace_settings.name);
-
-                if (ibuf == nullptr)
-                {
-                    continue;
-                }
-
-                // Ensure byte buffer exists (convert from float if needed)
-                if (ibuf->byte_buffer.data == nullptr && ibuf->float_buffer.data != nullptr)
-                {
-                    if (!IMB_alloc_byte_pixels(ibuf, false))
-                    {
-                        IMB_freeImBuf(ibuf);
-                        continue;
-                    }
-                    IMB_byte_from_float(ibuf);
-                }
-
-                if (ibuf->byte_buffer.data == nullptr)
+                if (!IMB_alloc_byte_pixels(ibuf, false))
                 {
                     IMB_freeImBuf(ibuf);
                     continue;
                 }
-
-                // Extract rgba8 data
-                size_t pixel_count = IMB_get_pixel_count(ibuf);
-                size_t blob_size   = pixel_count * 4;
-                uint8_t* blob_data = (uint8_t*)arena_alloc_z(arena, blob_size)->data;
-                memcpy(blob_data, ibuf->byte_buffer.data, blob_size);
-
-                char image_name[256];
-                snprintf(image_name, sizeof(image_name), "%s", replace_prefix(arena, ima->id.name, "IM", "img_"));
-
-                // Create BBArchiveImage
-                BBArchiveImage& bb_image  = images[image_idx];
-                bb_image.image_name       = arena_strdup_z(arena, image_name);
-                bb_image.width            = ibuf->x;
-                bb_image.height           = ibuf->y;
-                bb_image.num_channels     = 4;
-                bb_image.bits_per_channel = 8;
-                bb_image.is_srgb          = IMB_colormanagement_space_is_srgb(ibuf->byte_buffer.colorspace);
-                bb_image.mip_levels       = 1;
-                bb_image.blob             = blob_data;
-                bb_image.blob_size        = blob_size;
-
-                fprintf(log_file, "[zachary] Extracted rgba8 image: %s (%ux%u, %zu bytes)\n", bb_image.image_name, bb_image.width, bb_image.height, blob_size);
-
-                IMB_freeImBuf(ibuf);
-                image_idx++;
+                IMB_byte_from_float(ibuf);
             }
+
+            if (ibuf->byte_buffer.data == nullptr)
+            {
+                IMB_freeImBuf(ibuf);
+                continue;
+            }
+
+            // Extract rgba8 data
+            size_t pixel_count = IMB_get_pixel_count(ibuf);
+            size_t blob_size   = pixel_count * 4;
+            uint8_t* blob_data = (uint8_t*)arena_alloc_z(arena, blob_size)->data;
+            memcpy(blob_data, ibuf->byte_buffer.data, blob_size);
+
+            // Create BBArchiveImage
+            BBArchiveImage& bb_image  = bb_images[image_idx];
+            bb_image.image_name       = replace_prefix(arena, image.name.c_str(), "IM", "img_");
+            bb_image.width            = ibuf->x;
+            bb_image.height           = ibuf->y;
+            bb_image.num_channels     = 4;
+            bb_image.bits_per_channel = 8;
+            bb_image.is_srgb          = IMB_colormanagement_space_is_srgb(ibuf->byte_buffer.colorspace);
+            bb_image.mip_levels       = 1;
+            bb_image.blob             = blob_data;
+            bb_image.blob_size        = blob_size;
+
+            fprintf(log_file, "[zachary] Extracted rgba8 image: %s (%ux%u, %zu bytes)\n", bb_image.image_name, bb_image.width, bb_image.height, blob_size);
+
+            IMB_freeImBuf(ibuf);
+            image_idx++;
         }
 
         image_count = image_idx;
@@ -741,11 +721,11 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
         info.shader_graph_count = 0;
         info.scene_count        = scene_count;
         info.meshes             = meshes;
-        info.images             = images;
+        info.images             = bb_images;
         info.skeletons          = nullptr;
         info.animations         = nullptr;
         info.shader_graphs      = nullptr;
-        info.scenes             = scenes;
+        info.scenes             = bb_scenes;
 
         bb_archive_write(&info, bb_archive_output_dir);
         fprintf(log_file, "[zachary] bb_archive_write completed\n");
