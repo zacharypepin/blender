@@ -334,134 +334,76 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
         int total_scenes = BLI_listbase_count(&bmain->scenes);
         printf("[zachary] Found %d scenes\n", total_scenes);
 
-        if (total_scenes > 0)
+        scenes        = (BBArchiveScene*)arena_alloc_z(arena, sizeof(BBArchiveScene) * total_scenes)->data;
+
+        int scene_idx = 0;
+        LISTBASE_FOREACH(Scene*, scene, &bmain->scenes)
         {
-            std::vector<int> mesh_object_counts(total_scenes, 0);
-            int scene_idx = 0;
-            LISTBASE_FOREACH(Scene*, scene, &bmain->scenes)
+            int mesh_object_count = 0;
+            FOREACH_SCENE_OBJECT_BEGIN(scene, ob)
             {
-                FOREACH_SCENE_OBJECT_BEGIN(scene, ob)
+                if (ob->type == OB_MESH && ob->data != nullptr && valid_meshes.find((Mesh*)ob->data) != valid_meshes.end())
                 {
-                    if (ob->type == OB_MESH && ob->data != nullptr)
-                    {
-                        Mesh* mesh = (Mesh*)ob->data;
-                        if (valid_meshes.find(mesh) != valid_meshes.end())
-                        {
-                            mesh_object_counts[scene_idx]++;
-                        }
-                    }
-                }
-                FOREACH_SCENE_OBJECT_END;
-                scene_idx++;
-            }
-
-            int scenes_with_objects = 0;
-            for (int count : mesh_object_counts)
-            {
-                if (count > 0)
-                {
-                    scenes_with_objects++;
+                    mesh_object_count++;
                 }
             }
+            FOREACH_SCENE_OBJECT_END;
 
-            printf("[zachary] Found %d scenes with mesh objects\n", scenes_with_objects);
+            printf("[zachary] Processing scene: %s (%d mesh objects)\n", scene->id.name, mesh_object_count);
 
-            // Allocate scenes array
-            scenes               = (BBArchiveScene*)arena_alloc_z(arena, sizeof(BBArchiveScene) * scenes_with_objects)->data;
+            BBArchiveSceneElem* elems = (BBArchiveSceneElem*)arena_alloc_z(arena, sizeof(BBArchiveSceneElem) * mesh_object_count)->data;
+            int elem_idx              = 0;
 
-            scene_idx            = 0;
-            int output_scene_idx = 0;
-            LISTBASE_FOREACH(Scene*, scene, &bmain->scenes)
+            FOREACH_SCENE_OBJECT_BEGIN(scene, ob)
             {
-                int mesh_object_count = mesh_object_counts[scene_idx];
-                if (mesh_object_count == 0)
+                if (ob->type != OB_MESH || ob->data == nullptr) continue;
+
+                Mesh* mesh = (Mesh*)ob->data;
+                if (valid_meshes.find(mesh) == valid_meshes.end())
                 {
-                    scene_idx++;
+                    printf("[zachary]   Skipping object: %s (mesh: %s - invalid mesh)\n", ob->id.name, mesh->id.name);
                     continue;
                 }
 
-                printf("[zachary] Processing scene: %s (%d mesh objects)\n", scene->id.name, mesh_object_count);
+                printf("[zachary]   Processing object: %s (mesh: %s)\n", ob->id.name, mesh->id.name);
 
-                // Allocate scene elements
-                BBArchiveSceneElem* elems = (BBArchiveSceneElem*)arena_alloc_z(arena, sizeof(BBArchiveSceneElem) * mesh_object_count)->data;
-
-                int elem_idx              = 0;
-                FOREACH_SCENE_OBJECT_BEGIN(scene, ob)
+                int mat_count = 0;
+                for (int i = 0; i < ob->totcol; i++)
                 {
-                    if (ob->type != OB_MESH || ob->data == nullptr)
-                    {
-                        continue;
-                    }
-
-                    Mesh* mesh = (Mesh*)ob->data;
-                    if (valid_meshes.find(mesh) == valid_meshes.end())
-                    {
-                        printf("[zachary]   Skipping object: %s (mesh: %s - invalid mesh)\n", ob->id.name, mesh->id.name);
-                        continue;
-                    }
-
-                    printf("[zachary]   Processing object: %s (mesh: %s)\n", ob->id.name, mesh->id.name);
-
-                    // Extract transform
-                    float pos[3]  = {ob->loc[0], ob->loc[1], ob->loc[2]};
-                    float rot[3]  = {ob->rot[0], ob->rot[1], ob->rot[2]};
-                    float sca[3]  = {ob->scale[0], ob->scale[1], ob->scale[2]};
-
-                    // Extract material names
-                    int mat_count = 0;
-                    for (int i = 0; i < ob->totcol; i++)
-                    {
-                        Material* mat = BKE_object_material_get(ob, i + 1);
-                        if (mat != nullptr)
-                        {
-                            mat_count++;
-                        }
-                    }
-
-                    const char** mat_names = (const char**)arena_alloc_z(arena, sizeof(const char*) * mat_count)->data;
-                    int mat_idx            = 0;
-                    for (int i = 0; i < ob->totcol; i++)
-                    {
-                        Material* mat = BKE_object_material_get(ob, i + 1);
-                        if (mat != nullptr)
-                        {
-                            mat_names[mat_idx] = replace_prefix(arena, mat->id.name, "MA", "mat_shad_");
-                            mat_idx++;
-                        }
-                    }
-
-                    // Create scene element
-                    BBArchiveSceneElem& elem = elems[elem_idx];
-                    elem.mesh_name           = replace_prefix(arena, mesh->id.name, "ME", "mesh_");
-                    elem.pos[0]              = pos[0];
-                    elem.pos[1]              = pos[1];
-                    elem.pos[2]              = pos[2];
-                    elem.rot[0]              = rot[0];
-                    elem.rot[1]              = rot[1];
-                    elem.rot[2]              = rot[2];
-                    elem.sca[0]              = sca[0];
-                    elem.sca[1]              = sca[1];
-                    elem.sca[2]              = sca[2];
-                    elem.mat_count           = mat_count;
-                    elem.mat_names           = mat_names;
-
-                    elem_idx++;
+                    if (BKE_object_material_get(ob, i + 1) != nullptr) mat_count++;
                 }
-                FOREACH_SCENE_OBJECT_END;
 
-                // Create scene
-                scenes[output_scene_idx].scene_name = replace_prefix(arena, scene->id.name, "SC", "scene_");
-                scenes[output_scene_idx].elem_count = elem_idx;
-                scenes[output_scene_idx].elems      = elems;
+                const char** mat_names = (const char**)arena_alloc_z(arena, sizeof(const char*) * mat_count)->data;
+                for (int i = 0, mat_idx = 0; i < ob->totcol; i++)
+                {
+                    Material* mat = BKE_object_material_get(ob, i + 1);
+                    if (mat != nullptr) mat_names[mat_idx++] = replace_prefix(arena, mat->id.name, "MA", "mat_shad_");
+                }
 
-                printf("[zachary] Created scene: %s with %u elements\n", scenes[output_scene_idx].scene_name, scenes[output_scene_idx].elem_count);
-
-                output_scene_idx++;
-                scene_idx++;
+                BBArchiveSceneElem& elem = elems[elem_idx++];
+                elem.mesh_name           = replace_prefix(arena, mesh->id.name, "ME", "mesh_");
+                elem.pos[0]              = ob->loc[0];
+                elem.pos[1]              = ob->loc[1];
+                elem.pos[2]              = ob->loc[2];
+                elem.rot[0]              = ob->rot[0];
+                elem.rot[1]              = ob->rot[1];
+                elem.rot[2]              = ob->rot[2];
+                elem.sca[0]              = ob->scale[0];
+                elem.sca[1]              = ob->scale[1];
+                elem.sca[2]              = ob->scale[2];
+                elem.mat_count           = mat_count;
+                elem.mat_names           = mat_names;
             }
+            FOREACH_SCENE_OBJECT_END;
 
-            scene_count = scenes_with_objects;
+            scenes[scene_idx].scene_name = replace_prefix(arena, scene->id.name, "SC", "scene_");
+            scenes[scene_idx].elem_count = elem_idx;
+            scenes[scene_idx].elems      = elems;
+            printf("[zachary] Created scene: %s with %u elements\n", scenes[scene_idx].scene_name, scenes[scene_idx].elem_count);
+            scene_idx++;
         }
+
+        scene_count = total_scenes;
     }
 
     // ===============================================================================================
