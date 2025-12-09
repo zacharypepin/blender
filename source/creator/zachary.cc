@@ -33,6 +33,7 @@
 #include "zp_c/arena.h"
 
 #include <string>
+#include <array>
 
 // =========================================================================================================================================
 // =========================================================================================================================================
@@ -40,6 +41,12 @@
 // =========================================================================================================================================
 namespace
 {
+    struct vec2_t
+    {
+        float x;
+        float y;
+    };
+
     struct vec3_t
     {
         float x;
@@ -47,9 +54,17 @@ namespace
         float z;
     };
 
+    struct vertex_t
+    {
+        vec3_t position;
+        vec2_t uv;
+        std::array<uint8_t, 4> joint_indices;
+        std::array<float, 4> joint_weights;
+    };
+
     struct triangle_t
     {
-        vec3_t vertices[3];
+        std::array<vertex_t, 3> vertices;
     };
 
     struct submesh_t
@@ -200,12 +215,22 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 if (ob->type != OB_MESH || ob->data == nullptr) continue;
 
                 // Extract mesh geometry data
-                Mesh* mesh                                 = (Mesh*)ob->data;
-                blender::Span<blender::float3> positions   = mesh->vert_positions();
-                blender::Span<int> corner_verts            = mesh->corner_verts();
-                blender::Span<blender::int3> corner_tris   = mesh->corner_tris();
-                blender::Span<int> corner_tri_faces        = mesh->corner_tri_faces();
-                blender::bke::AttributeAccessor attributes = mesh->attributes();
+                Mesh* mesh                                              = (Mesh*)ob->data;
+                blender::Span<blender::float3> positions                = mesh->vert_positions();
+                blender::Span<int> corner_verts                         = mesh->corner_verts();
+                blender::Span<blender::int3> corner_tris                = mesh->corner_tris();
+                blender::Span<int> corner_tri_faces                     = mesh->corner_tri_faces();
+                blender::bke::AttributeAccessor attributes              = mesh->attributes();
+                blender::VectorSet<blender::StringRefNull> uv_map_names = mesh->uv_map_names();
+                blender::Span<MDeformVert> deform_verts                 = mesh->deform_verts();
+                bool has_joint_data                                     = !deform_verts.is_empty() && mesh->corners_num > 0;
+
+                // Cache UV map (just the first one for now)
+                blender::VArraySpan<blender::float2> uv_map;
+                if (!uv_map_names.is_empty())
+                {
+                    uv_map = *attributes.lookup<blender::float2>(uv_map_names[0], blender::bke::AttrDomain::Corner);
+                }
 
                 // Check for empty material slots
                 {
@@ -273,11 +298,38 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                         triangle_t triangle;
                         for (int i = 0; i < 3; i++)
                         {
-                            int corner             = tri[i];
-                            int vert_idx           = corner_verts[corner];
-                            triangle.vertices[i].x = positions[vert_idx].x;
-                            triangle.vertices[i].y = positions[vert_idx].y;
-                            triangle.vertices[i].z = positions[vert_idx].z;
+                            int corner                      = tri[i];
+                            int vert_idx                    = corner_verts[corner];
+
+                            // Position
+                            triangle.vertices[i].position.x = positions[vert_idx].x;
+                            triangle.vertices[i].position.y = positions[vert_idx].y;
+                            triangle.vertices[i].position.z = positions[vert_idx].z;
+
+                            // UV
+                            if (!uv_map.is_empty() && corner < uv_map.size())
+                            {
+                                triangle.vertices[i].uv.x = uv_map[corner].x;
+                                triangle.vertices[i].uv.y = uv_map[corner].y;
+                            }
+
+                            // Joint data
+                            triangle.vertices[i].joint_indices.fill(0);
+                            triangle.vertices[i].joint_weights.fill(0.0f);
+                            if (has_joint_data && vert_idx < deform_verts.size())
+                            {
+                                const MDeformVert& dvert = deform_verts[vert_idx];
+                                int joint_count          = 0;
+                                for (int j = 0; j < dvert.totweight && joint_count < 4; j++)
+                                {
+                                    if (dvert.dw[j].weight > 0.0f)
+                                    {
+                                        triangle.vertices[i].joint_indices[joint_count] = (uint8_t)dvert.dw[j].def_nr;
+                                        triangle.vertices[i].joint_weights[joint_count] = dvert.dw[j].weight;
+                                        joint_count++;
+                                    }
+                                }
+                            }
                         }
                         submesh.triangles.push_back(triangle);
                     }
@@ -424,128 +476,68 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
     BBArchiveMesh* meshes = nullptr;
     int mesh_count        = 0;
     {
-        mesh_count = valid_meshes.size();
-        fprintf(log_file, "[zachary] Processing %d valid meshes\n", mesh_count);
+        // Collect unique meshes by name from data_t
+        std::map<std::string, const mesh_t*> unique_meshes;
+        for (const scene_t& scene : data.scenes)
+        {
+            for (const scene_elem_t& elem : scene.elems)
+            {
+                if (unique_meshes.find(elem.mesh.name) == unique_meshes.end())
+                {
+                    unique_meshes[elem.mesh.name] = &elem.mesh;
+                }
+            }
+        }
+
+        mesh_count = unique_meshes.size();
+        fprintf(log_file, "[zachary] Processing %d unique meshes from data_t\n", mesh_count);
 
         meshes       = (BBArchiveMesh*)arena_alloc_z(arena, sizeof(BBArchiveMesh) * mesh_count)->data;
 
         int mesh_idx = 0;
-        for (Mesh* mesh : valid_meshes)
+        for (const auto& [mesh_name, mesh_ptr] : unique_meshes)
         {
-            fprintf(log_file, "[zachary] Processing mesh: %s (verts: %d, corners: %d, faces: %d)\n", mesh->id.name, mesh->verts_num, mesh->corners_num, mesh->faces_num);
+            const mesh_t& mesh = *mesh_ptr;
+            fprintf(log_file, "[zachary] Processing mesh: %s (%zu submeshes)\n", mesh.name.c_str(), mesh.submeshes.size());
 
-            // Get mesh data
-            blender::Span<blender::float3> positions                = mesh->vert_positions();
-            blender::Span<int> corner_verts                         = mesh->corner_verts();
-            blender::Span<blender::int3> corner_tris                = mesh->corner_tris();
-            blender::Span<int> corner_tri_faces                     = mesh->corner_tri_faces();
-            blender::bke::AttributeAccessor attributes              = mesh->attributes();
-            blender::VectorSet<blender::StringRefNull> uv_map_names = mesh->uv_map_names();
-            blender::Span<MDeformVert> deform_verts                 = mesh->deform_verts();
-            bool has_joint_data                                     = !deform_verts.is_empty() && mesh->corners_num > 0;
-
-            // Group tris by material index
-            std::map<int, std::vector<int>> triangles_by_material;
-            {
-                const blender::VArray<int> material_indices_varray = *attributes.lookup_or_default<int>("material_index", blender::bke::AttrDomain::Face, 0);
-                blender::VArraySpan<int> material_indices(material_indices_varray);
-
-                for (int tri_idx = 0; tri_idx < corner_tris.size(); tri_idx++)
-                {
-                    int face_idx = corner_tri_faces[tri_idx];
-                    int mat_idx  = material_indices[face_idx];
-                    triangles_by_material[mat_idx].push_back(tri_idx);
-                }
-            }
-
-            int submesh_count = triangles_by_material.size();
-            fprintf(log_file, "[zachary]   Found %d material(s), creating %d submesh(es)\n", submesh_count, submesh_count);
-            fprintf(log_file, "[zachary]   Total triangles: %d\n", (int)corner_tris.size());
-
-            // Cache UV maps
-            blender::VArraySpan<blender::float2> uv_maps[3];
-            for (int uv_idx = 0; uv_idx < uv_map_names.size() && uv_idx < 3; uv_idx++)
-            {
-                uv_maps[uv_idx] = *attributes.lookup<blender::float2>(uv_map_names[uv_idx], blender::bke::AttrDomain::Corner);
-                if (!uv_maps[uv_idx].is_empty())
-                {
-                    fprintf(log_file, "[zachary]   Loaded UV map %d: %s\n", uv_idx, uv_map_names[uv_idx].c_str());
-                }
-            }
-
-            // Allocate submeshes array
+            int submesh_count           = mesh.submeshes.size();
             BBArchiveSubmesh* submeshes = (BBArchiveSubmesh*)arena_alloc_z(arena, sizeof(BBArchiveSubmesh) * submesh_count)->data;
 
-            int submesh_idx             = 0;
-            for (const auto& [mat_idx, triangle_indices] : triangles_by_material)
+            for (size_t submesh_idx = 0; submesh_idx < mesh.submeshes.size(); submesh_idx++)
             {
-                int total_vertices = triangle_indices.size() * 3;
+                const submesh_t& src_submesh = mesh.submeshes[submesh_idx];
+                int total_vertices           = src_submesh.triangles.size() * 3;
 
-                fprintf(log_file, "[zachary]   Material %d: %d triangles, %d vertices\n", mat_idx, (int)triangle_indices.size(), total_vertices);
+                fprintf(log_file, "[zachary]   Submesh %zu: %zu triangles, %d vertices\n", submesh_idx, src_submesh.triangles.size(), total_vertices);
 
-                // Allocate position data
-                float* positions_data = (float*)arena_alloc_z(arena, sizeof(float) * 3 * total_vertices)->data;
+                // Allocate data arrays
+                float* positions_data       = (float*)arena_alloc_z(arena, sizeof(float) * 3 * total_vertices)->data;
+                float* uv_data              = (float*)arena_alloc_z(arena, sizeof(float) * 2 * total_vertices)->data;
+                uint8_t* joint_indices_data = (uint8_t*)arena_alloc_z(arena, sizeof(uint8_t) * 4 * total_vertices)->data;
+                float* joint_weights_data   = (float*)arena_alloc_z(arena, sizeof(float) * 4 * total_vertices)->data;
 
-                // Allocate uv data
-                float* uv_data[3]     = {nullptr, nullptr, nullptr};
-                for (int uv_idx = 0; uv_idx < 3; uv_idx++)
+                // Fill data arrays from triangles
+                int vertex_offset           = 0;
+                for (const triangle_t& tri : src_submesh.triangles)
                 {
-                    if (!uv_maps[uv_idx].is_empty())
-                    {
-                        uv_data[uv_idx] = (float*)arena_alloc_z(arena, sizeof(float) * 2 * total_vertices)->data;
-                    }
-                }
-
-                // Allocate joint data
-                uint8_t* joint_indices_data = nullptr;
-                float* joint_weights_data   = nullptr;
-                if (has_joint_data)
-                {
-                    joint_indices_data = (uint8_t*)arena_alloc_z(arena, sizeof(uint8_t) * 4 * total_vertices)->data;
-                    joint_weights_data = (float*)arena_alloc_z(arena, sizeof(float) * 4 * total_vertices)->data;
-                    memset(joint_indices_data, 0, sizeof(uint8_t) * 4 * total_vertices);
-                    memset(joint_weights_data, 0, sizeof(float) * 4 * total_vertices);
-                }
-
-                // Fill data arrays
-                int vertex_offset = 0;
-                for (int tri_idx : triangle_indices)
-                {
-                    blender::int3 tri = corner_tris[tri_idx];
                     for (int i = 0; i < 3; i++)
                     {
-                        int corner                            = tri[i];
-                        int vert_idx                          = corner_verts[corner];
+                        const vertex_t& vert                  = tri.vertices[i];
 
                         // Position
-                        positions_data[vertex_offset * 3 + 0] = positions[vert_idx].x;
-                        positions_data[vertex_offset * 3 + 1] = positions[vert_idx].y;
-                        positions_data[vertex_offset * 3 + 2] = positions[vert_idx].z;
+                        positions_data[vertex_offset * 3 + 0] = vert.position.x;
+                        positions_data[vertex_offset * 3 + 1] = vert.position.y;
+                        positions_data[vertex_offset * 3 + 2] = vert.position.z;
 
-                        // UV maps
-                        for (int uv_idx = 0; uv_idx < 3; uv_idx++)
-                        {
-                            if (uv_data[uv_idx] != nullptr && corner < uv_maps[uv_idx].size())
-                            {
-                                uv_data[uv_idx][vertex_offset * 2 + 0] = uv_maps[uv_idx][corner].x;
-                                uv_data[uv_idx][vertex_offset * 2 + 1] = uv_maps[uv_idx][corner].y;
-                            }
-                        }
+                        // UV
+                        uv_data[vertex_offset * 2 + 0]        = vert.uv.x;
+                        uv_data[vertex_offset * 2 + 1]        = vert.uv.y;
 
                         // Joint data
-                        if (has_joint_data && vert_idx < deform_verts.size())
+                        for (int j = 0; j < 4; j++)
                         {
-                            const MDeformVert& dvert = deform_verts[vert_idx];
-                            int joint_count          = 0;
-                            for (int j = 0; j < dvert.totweight && joint_count < 4; j++)
-                            {
-                                if (dvert.dw[j].weight > 0.0f)
-                                {
-                                    joint_indices_data[vertex_offset * 4 + joint_count] = (uint8_t)dvert.dw[j].def_nr;
-                                    joint_weights_data[vertex_offset * 4 + joint_count] = dvert.dw[j].weight;
-                                    joint_count++;
-                                }
-                            }
+                            joint_indices_data[vertex_offset * 4 + j] = vert.joint_indices[j];
+                            joint_weights_data[vertex_offset * 4 + j] = vert.joint_weights[j];
                         }
 
                         vertex_offset++;
@@ -556,23 +548,16 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 BBArchiveSubmesh& submesh = submeshes[submesh_idx];
                 submesh.vertex_count      = total_vertices;
                 submesh.positions         = positions_data;
-                submesh.uv0               = uv_data[0];
-                submesh.uv1               = uv_data[1];
-                submesh.uv2               = uv_data[2];
+                submesh.uv0               = uv_data;
+                submesh.uv1               = nullptr;
+                submesh.uv2               = nullptr;
                 submesh.joint_indices     = joint_indices_data;
                 submesh.joint_weights     = joint_weights_data;
-
-                submesh_idx++;
             }
 
             // Create mesh structure
             BBArchiveMesh* bb_mesh = &meshes[mesh_idx];
-            {
-                std::string processed_name = replace_prefix(mesh->id.name, "ME", "mesh_");
-                char* name_copy            = (char*)arena_alloc_z(arena, processed_name.size() + 1)->data;
-                strcpy(name_copy, processed_name.c_str());
-                bb_mesh->mesh_name = name_copy;
-            }
+            bb_mesh->mesh_name     = mesh.name.c_str();
             bb_mesh->submesh_count = submesh_count;
             bb_mesh->submeshes     = submeshes;
 
