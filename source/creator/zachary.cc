@@ -422,49 +422,6 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
 
     // ===============================================================================================
     // ===============================================================================================
-    // Validate .blend file
-    // ===============================================================================================
-    // ===============================================================================================
-    std::vector<const char*> invalid_mesh_names;
-    std::unordered_set<Mesh*> valid_meshes;
-    {
-        fprintf(log_file, "[zachary] Validating .blend file...\n");
-
-        LISTBASE_FOREACH(Mesh*, mesh, &bmain->meshes)
-        {
-            bool is_invalid = false;
-            if (mesh->totcol > 0 && mesh->mat != nullptr)
-            {
-                for (int i = 0; i < mesh->totcol; i++)
-                {
-                    if (mesh->mat[i] == nullptr)
-                    {
-                        fprintf(stderr, "[zachary] VALIDATION ERROR: Mesh %s has empty material slot at index %d (total slots: %d)\n", mesh->id.name, i, mesh->totcol);
-                        invalid_mesh_names.push_back(mesh->id.name);
-                        is_invalid = true;
-                        break;
-                    }
-                }
-            }
-
-            if (is_invalid)
-            {
-                continue;
-            }
-
-            if (mesh->verts_num == 0)
-            {
-                fprintf(log_file, "[zachary] Skipping mesh %s (no vertices)\n", mesh->id.name);
-                invalid_mesh_names.push_back(mesh->id.name);
-                continue;
-            }
-
-            valid_meshes.insert(mesh);
-        }
-    }
-
-    // ===============================================================================================
-    // ===============================================================================================
     // ===============================================================================================
     // ===============================================================================================
     arena_zh arena        = arena_init_z(8ULL * 1024ULL * 1024ULL * 1024ULL);
@@ -711,23 +668,6 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
 
         bb_archive_write(&info, bb_archive_output_dir);
         fprintf(log_file, "[zachary] bb_archive_write completed\n");
-    }
-
-    // ===============================================================================================
-    // ===============================================================================================
-    // Print invalid meshes
-    // ===============================================================================================
-    // ===============================================================================================
-    {
-        if (!invalid_mesh_names.empty())
-        {
-            fprintf(log_file, "[zachary] Invalid meshes skipped (empty material slots or no vertices):\n");
-            for (const char* mesh_name : invalid_mesh_names)
-            {
-                fprintf(log_file, "[zachary]   - %s\n", replace_prefix(mesh_name, "ME", "mesh_").c_str());
-            }
-            fprintf(log_file, "[zachary] Total invalid meshes: %d\n", (int)invalid_mesh_names.size());
-        }
     }
 
     fclose(log_file);
