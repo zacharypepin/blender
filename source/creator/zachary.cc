@@ -98,57 +98,32 @@ namespace
 // =========================================================================================================================================
 // =========================================================================================================================================
 // =========================================================================================================================================
-static const char* replace_prefix(arena_zh arena, const char* name, const char* old_prefix, const char* new_prefix)
+static std::string replace_prefix(const char* name, const char* old_prefix, const char* new_prefix)
 {
     if (name == nullptr)
     {
-        return name;
+        return std::string();
     }
 
-    const char* processed_name = name;
-    size_t name_len            = strlen(name);
-    size_t old_prefix_len      = strlen(old_prefix);
-    size_t new_prefix_len      = strlen(new_prefix);
-    char* new_name             = nullptr;
+    std::string result    = name;
 
-    if (strncmp(name, old_prefix, old_prefix_len) == 0)
+    // Replace prefix if it matches
+    size_t old_prefix_len = strlen(old_prefix);
+    if (result.compare(0, old_prefix_len, old_prefix) == 0)
     {
-        size_t buffer_size = name_len - old_prefix_len + new_prefix_len + 1;
-        new_name           = (char*)arena_alloc_z(arena, buffer_size)->data;
-        snprintf(new_name, buffer_size, "%s%s", new_prefix, name + old_prefix_len);
-        processed_name = new_name;
-        name_len       = strlen(processed_name);
+        result = std::string(new_prefix) + result.substr(old_prefix_len);
     }
 
     // Replace spaces with underscores
-    bool has_spaces = false;
-    for (size_t i = 0; i < name_len; i++)
+    for (char& c : result)
     {
-        if (processed_name[i] == ' ')
+        if (c == ' ')
         {
-            has_spaces = true;
-            break;
+            c = '_';
         }
     }
 
-    if (has_spaces)
-    {
-        if (new_name == nullptr)
-        {
-            new_name = (char*)arena_alloc_z(arena, name_len + 1)->data;
-            strcpy(new_name, processed_name);
-        }
-        for (size_t i = 0; i < name_len; i++)
-        {
-            if (new_name[i] == ' ')
-            {
-                new_name[i] = '_';
-            }
-        }
-        return new_name;
-    }
-
-    return processed_name;
+    return result;
 }
 
 // =========================================================================================================================================
@@ -218,7 +193,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
         LISTBASE_FOREACH(Scene*, scene, &bmain->scenes)
         {
             scene_t scene_data;
-            scene_data.name = scene->id.name;
+            scene_data.name = replace_prefix(scene->id.name, "SC", "scene_");
 
             FOREACH_SCENE_OBJECT_BEGIN(scene, ob)
             {
@@ -265,7 +240,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 elem.scale.y      = ob->scale[1];
                 elem.scale.z      = ob->scale[2];
 
-                elem.mesh.name    = mesh->id.name;
+                elem.mesh.name    = replace_prefix(mesh->id.name, "ME", "mesh_");
 
                 // Group triangles by material index
                 std::map<int, std::vector<int>> triangles_by_material;
@@ -289,7 +264,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                     Material* mat = BKE_object_material_get(ob, mat_idx + 1);
                     if (mat != nullptr)
                     {
-                        submesh.material_name = mat->id.name;
+                        submesh.material_name = replace_prefix(mat->id.name, "MA", "mat_shad_");
                     }
 
                     for (int tri_idx : triangle_indices)
@@ -332,7 +307,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 }
 
                 image_t image          = {};
-                image.name             = ima->id.name;
+                image.name             = replace_prefix(ima->id.name, "IM", "img_");
                 image.colourspace_name = ima->colorspace_settings.name;
                 image.packedfile_data  = imapf->packedfile->data;
                 image.packedfile_size  = imapf->packedfile->size;
@@ -592,7 +567,12 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
 
             // Create mesh structure
             BBArchiveMesh* bb_mesh = &meshes[mesh_idx];
-            bb_mesh->mesh_name     = replace_prefix(arena, mesh->id.name, "ME", "mesh_");
+            {
+                std::string processed_name = replace_prefix(mesh->id.name, "ME", "mesh_");
+                char* name_copy            = (char*)arena_alloc_z(arena, processed_name.size() + 1)->data;
+                strcpy(name_copy, processed_name.c_str());
+                bb_mesh->mesh_name = name_copy;
+            }
             bb_mesh->submesh_count = submesh_count;
             bb_mesh->submeshes     = submeshes;
 
@@ -630,11 +610,11 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 const char** mat_names       = (const char**)arena_alloc_z(arena, sizeof(const char*) * mat_count)->data;
                 for (size_t i = 0; i < src_elem.mesh.submeshes.size(); i++)
                 {
-                    mat_names[i] = replace_prefix(arena, src_elem.mesh.submeshes[i].material_name.c_str(), "MA", "mat_shad_");
+                    mat_names[i] = src_elem.mesh.submeshes[i].material_name.c_str();
                 }
 
                 BBArchiveSceneElem& elem = elems[elem_idx];
-                elem.mesh_name           = replace_prefix(arena, src_elem.mesh.name.c_str(), "ME", "mesh_");
+                elem.mesh_name           = src_elem.mesh.name.c_str();
                 elem.pos[0]              = src_elem.pos.x;
                 elem.pos[1]              = src_elem.pos.y;
                 elem.pos[2]              = src_elem.pos.z;
@@ -648,7 +628,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 elem.mat_names           = mat_names;
             }
 
-            bb_scenes[scene_idx].scene_name = replace_prefix(arena, scene.name.c_str(), "SC", "scene_");
+            bb_scenes[scene_idx].scene_name = scene.name.c_str();
             bb_scenes[scene_idx].elem_count = scene.elems.size();
             bb_scenes[scene_idx].elems      = elems;
             fprintf(log_file, "[zachary] Created scene: %s with %u elements\n", bb_scenes[scene_idx].scene_name, bb_scenes[scene_idx].elem_count);
@@ -705,7 +685,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
 
             // Create BBArchiveImage
             BBArchiveImage& bb_image  = bb_images[image_idx];
-            bb_image.image_name       = replace_prefix(arena, image.name.c_str(), "IM", "img_");
+            bb_image.image_name       = image.name.c_str();
             bb_image.width            = ibuf->x;
             bb_image.height           = ibuf->y;
             bb_image.num_channels     = 4;
@@ -759,7 +739,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
             fprintf(log_file, "[zachary] Invalid meshes skipped (empty material slots or no vertices):\n");
             for (const char* mesh_name : invalid_mesh_names)
             {
-                fprintf(log_file, "[zachary]   - %s\n", replace_prefix(arena, mesh_name, "ME", "mesh_"));
+                fprintf(log_file, "[zachary]   - %s\n", replace_prefix(mesh_name, "ME", "mesh_").c_str());
             }
             fprintf(log_file, "[zachary] Total invalid meshes: %d\n", (int)invalid_mesh_names.size());
         }
