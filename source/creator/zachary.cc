@@ -96,9 +96,10 @@ namespace
     struct image_t
     {
         std::string name;
-        std::string colourspace_name;
-        const void* packedfile_data;
-        uint64_t packedfile_size;
+        std::vector<uint8_t> rgba_data;
+        uint32_t width;
+        uint32_t height;
+        bool is_srgb;
     };
 
     struct data_t
@@ -358,12 +359,44 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                     continue;
                 }
 
-                image_t image          = {};
-                image.name             = replace_prefix(ima->id.name, "IM", "img_");
-                image.colourspace_name = ima->colorspace_settings.name;
-                image.packedfile_data  = imapf->packedfile->data;
-                image.packedfile_size  = imapf->packedfile->size;
-                data.images.push_back(image);
+                int flag    = IB_byte_data | IB_metadata;
+                ImBuf* ibuf = IMB_load_image_from_memory((const unsigned char*)imapf->packedfile->data, imapf->packedfile->size, flag, "<packed data>", nullptr, (char*)ima->colorspace_settings.name);
+
+                if (ibuf == nullptr)
+                {
+                    continue;
+                }
+
+                // Ensure byte buffer exists (convert from float if needed)
+                if (ibuf->byte_buffer.data == nullptr && ibuf->float_buffer.data != nullptr)
+                {
+                    if (!IMB_alloc_byte_pixels(ibuf, false))
+                    {
+                        IMB_freeImBuf(ibuf);
+                        continue;
+                    }
+                    IMB_byte_from_float(ibuf);
+                }
+
+                if (ibuf->byte_buffer.data == nullptr)
+                {
+                    IMB_freeImBuf(ibuf);
+                    continue;
+                }
+
+                size_t pixel_count = IMB_get_pixel_count(ibuf);
+                size_t data_size   = pixel_count * 4;
+
+                image_t image      = {};
+                image.name         = replace_prefix(ima->id.name, "IM", "img_");
+                image.width        = ibuf->x;
+                image.height       = ibuf->y;
+                image.is_srgb      = IMB_colormanagement_space_is_srgb(ibuf->byte_buffer.colorspace);
+                image.rgba_data.resize(data_size);
+                memcpy(image.rgba_data.data(), ibuf->byte_buffer.data, data_size);
+
+                IMB_freeImBuf(ibuf);
+                data.images.push_back(std::move(image));
             }
         }
     }
@@ -405,7 +438,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
         for (size_t image_idx = 0; image_idx < data.images.size(); image_idx++)
         {
             const image_t& image = data.images[image_idx];
-            fprintf(log_file, "[zachary]   Image[%zu]: %s (colourspace=%s, size=%lu)\n", image_idx, image.name.c_str(), image.colourspace_name.c_str(), image.packedfile_size);
+            fprintf(log_file, "[zachary]   Image[%zu]: %s (%ux%u, srgb=%d, size=%zu)\n", image_idx, image.name.c_str(), image.width, image.height, image.is_srgb, image.rgba_data.size());
         }
 
         if (!data.invalid_mesh_names.empty())
@@ -529,12 +562,11 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
     // Extract scene data
     // ===============================================================================================
     // ===============================================================================================
-    BBArchiveScene* bb_scenes;
-    int scene_count;
+    std::vector<BBArchiveScene> bb_scenes;
     {
         fprintf(log_file, "[zachary] Found %zu scenes\n", data.scenes.size());
 
-        bb_scenes = (BBArchiveScene*)arena_alloc_z(arena, sizeof(BBArchiveScene) * data.scenes.size())->data;
+        bb_scenes.resize(data.scenes.size());
 
         for (size_t scene_idx = 0; scene_idx < data.scenes.size(); scene_idx++)
         {
@@ -575,8 +607,6 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
             bb_scenes[scene_idx].elems      = elems;
             fprintf(log_file, "[zachary] Created scene: %s with %u elements\n", bb_scenes[scene_idx].scene_name, bb_scenes[scene_idx].elem_count);
         }
-
-        scene_count = data.scenes.size();
     }
 
     // ===============================================================================================
@@ -584,66 +614,29 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
     // Extract images for bb_archive
     // ===============================================================================================
     // ===============================================================================================
-    BBArchiveImage* bb_images = nullptr;
-    int image_count           = 0;
+    std::vector<BBArchiveImage> bb_images;
     {
         fprintf(log_file, "[zachary] Found %zu packed images\n", data.images.size());
 
-        bb_images     = (BBArchiveImage*)arena_alloc_z(arena, sizeof(BBArchiveImage) * data.images.size())->data;
+        bb_images.resize(data.images.size());
 
-        int image_idx = 0;
-        for (const image_t& image : data.images)
+        for (size_t image_idx = 0; image_idx < data.images.size(); image_idx++)
         {
-            int flag    = IB_byte_data | IB_metadata;
-            ImBuf* ibuf = IMB_load_image_from_memory((const unsigned char*)image.packedfile_data, image.packedfile_size, flag, "<packed data>", nullptr, (char*)image.colourspace_name.c_str());
+            const image_t& image      = data.images[image_idx];
 
-            if (ibuf == nullptr)
-            {
-                continue;
-            }
-
-            // Ensure byte buffer exists (convert from float if needed)
-            if (ibuf->byte_buffer.data == nullptr && ibuf->float_buffer.data != nullptr)
-            {
-                if (!IMB_alloc_byte_pixels(ibuf, false))
-                {
-                    IMB_freeImBuf(ibuf);
-                    continue;
-                }
-                IMB_byte_from_float(ibuf);
-            }
-
-            if (ibuf->byte_buffer.data == nullptr)
-            {
-                IMB_freeImBuf(ibuf);
-                continue;
-            }
-
-            // Extract rgba8 data
-            size_t pixel_count = IMB_get_pixel_count(ibuf);
-            size_t blob_size   = pixel_count * 4;
-            uint8_t* blob_data = (uint8_t*)arena_alloc_z(arena, blob_size)->data;
-            memcpy(blob_data, ibuf->byte_buffer.data, blob_size);
-
-            // Create BBArchiveImage
             BBArchiveImage& bb_image  = bb_images[image_idx];
             bb_image.image_name       = image.name.c_str();
-            bb_image.width            = ibuf->x;
-            bb_image.height           = ibuf->y;
+            bb_image.width            = image.width;
+            bb_image.height           = image.height;
             bb_image.num_channels     = 4;
             bb_image.bits_per_channel = 8;
-            bb_image.is_srgb          = IMB_colormanagement_space_is_srgb(ibuf->byte_buffer.colorspace);
+            bb_image.is_srgb          = image.is_srgb;
             bb_image.mip_levels       = 1;
-            bb_image.blob             = blob_data;
-            bb_image.blob_size        = blob_size;
+            bb_image.blob             = image.rgba_data.data();
+            bb_image.blob_size        = image.rgba_data.size();
 
-            fprintf(log_file, "[zachary] Extracted rgba8 image: %s (%ux%u, %zu bytes)\n", bb_image.image_name, bb_image.width, bb_image.height, blob_size);
-
-            IMB_freeImBuf(ibuf);
-            image_idx++;
+            fprintf(log_file, "[zachary] Extracted rgba8 image: %s (%ux%u, %zu bytes)\n", bb_image.image_name, bb_image.width, bb_image.height, image.rgba_data.size());
         }
-
-        image_count = image_idx;
     }
 
     // ===============================================================================================
@@ -654,17 +647,17 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
     {
         BBArchiveInfo info      = {0};
         info.mesh_count         = mesh_count;
-        info.image_count        = image_count;
+        info.image_count        = bb_images.size();
         info.skeleton_count     = 0;
         info.animation_count    = 0;
         info.shader_graph_count = 0;
-        info.scene_count        = scene_count;
+        info.scene_count        = bb_scenes.size();
         info.meshes             = meshes;
-        info.images             = bb_images;
+        info.images             = bb_images.data();
         info.skeletons          = nullptr;
         info.animations         = nullptr;
         info.shader_graphs      = nullptr;
-        info.scenes             = bb_scenes;
+        info.scenes             = bb_scenes.data();
 
         bb_archive_write(&info, bb_archive_output_dir);
         fprintf(log_file, "[zachary] bb_archive_write completed\n");
