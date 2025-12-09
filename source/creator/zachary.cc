@@ -151,7 +151,20 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
     // ===============================================================================================
     // ===============================================================================================
     // ===============================================================================================
-    printf("[zachary] zachary_main()\n");
+    FILE* log_file;
+    {
+        if ((log_file = fopen("./zachary_log.txt", "w")) == nullptr)
+        {
+            fprintf(stderr, "[zachary] Failed to open log file\n");
+            return;
+        }
+    }
+
+    // ===============================================================================================
+    // ===============================================================================================
+    // ===============================================================================================
+    // ===============================================================================================
+    fprintf(log_file, "[zachary] zachary_main()\n");
 
     // ===============================================================================================
     // ===============================================================================================
@@ -159,10 +172,10 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
     // ===============================================================================================
     Main* bmain;
     {
-        bmain = CTX_data_main(C);
-        if (bmain == nullptr)
+        if ((bmain = CTX_data_main(C)) == nullptr)
         {
-            printf("No Main database available\n");
+            fprintf(stderr, "[zachary] ERROR: No Main database available\n");
+            fclose(log_file);
             return;
         }
     }
@@ -207,6 +220,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                     }
                     if (has_empty_material_slot)
                     {
+                        fprintf(log_file, "[zachary] Skipping mesh %s (has empty material slot)\n", mesh->id.name);
                         data.invalid_mesh_names.push_back(mesh->id.name);
                         continue;
                     }
@@ -283,7 +297,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
     std::vector<const char*> invalid_mesh_names;
     std::unordered_set<Mesh*> valid_meshes;
     {
-        printf("[zachary] Validating .blend file...\n");
+        fprintf(log_file, "[zachary] Validating .blend file...\n");
 
         LISTBASE_FOREACH(Mesh*, mesh, &bmain->meshes)
         {
@@ -294,7 +308,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 {
                     if (mesh->mat[i] == nullptr)
                     {
-                        printf("[zachary] VALIDATION ERROR: Mesh %s has empty material slot at index %d (total slots: %d)\n", mesh->id.name, i, mesh->totcol);
+                        fprintf(stderr, "[zachary] VALIDATION ERROR: Mesh %s has empty material slot at index %d (total slots: %d)\n", mesh->id.name, i, mesh->totcol);
                         invalid_mesh_names.push_back(mesh->id.name);
                         is_invalid = true;
                         break;
@@ -309,7 +323,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
 
             if (mesh->verts_num == 0)
             {
-                printf("[zachary] Skipping mesh %s (no vertices)\n", mesh->id.name);
+                fprintf(log_file, "[zachary] Skipping mesh %s (no vertices)\n", mesh->id.name);
                 invalid_mesh_names.push_back(mesh->id.name);
                 continue;
             }
@@ -332,14 +346,14 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
     int mesh_count        = 0;
     {
         mesh_count = valid_meshes.size();
-        printf("[zachary] Processing %d valid meshes\n", mesh_count);
+        fprintf(log_file, "[zachary] Processing %d valid meshes\n", mesh_count);
 
         meshes       = (BBArchiveMesh*)arena_alloc_z(arena, sizeof(BBArchiveMesh) * mesh_count)->data;
 
         int mesh_idx = 0;
         for (Mesh* mesh : valid_meshes)
         {
-            printf("[zachary] Processing mesh: %s (verts: %d, corners: %d, faces: %d)\n", mesh->id.name, mesh->verts_num, mesh->corners_num, mesh->faces_num);
+            fprintf(log_file, "[zachary] Processing mesh: %s (verts: %d, corners: %d, faces: %d)\n", mesh->id.name, mesh->verts_num, mesh->corners_num, mesh->faces_num);
 
             // Get mesh data
             blender::Span<blender::float3> positions                = mesh->vert_positions();
@@ -366,8 +380,8 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
             }
 
             int submesh_count = triangles_by_material.size();
-            printf("[zachary]   Found %d material(s), creating %d submesh(es)\n", submesh_count, submesh_count);
-            printf("[zachary]   Total triangles: %d\n", (int)corner_tris.size());
+            fprintf(log_file, "[zachary]   Found %d material(s), creating %d submesh(es)\n", submesh_count, submesh_count);
+            fprintf(log_file, "[zachary]   Total triangles: %d\n", (int)corner_tris.size());
 
             // Cache UV maps
             blender::VArraySpan<blender::float2> uv_maps[3];
@@ -376,7 +390,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 uv_maps[uv_idx] = *attributes.lookup<blender::float2>(uv_map_names[uv_idx], blender::bke::AttrDomain::Corner);
                 if (!uv_maps[uv_idx].is_empty())
                 {
-                    printf("[zachary]   Loaded UV map %d: %s\n", uv_idx, uv_map_names[uv_idx].c_str());
+                    fprintf(log_file, "[zachary]   Loaded UV map %d: %s\n", uv_idx, uv_map_names[uv_idx].c_str());
                 }
             }
 
@@ -388,7 +402,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
             {
                 int total_vertices = triangle_indices.size() * 3;
 
-                printf("[zachary]   Material %d: %d triangles, %d vertices\n", mat_idx, (int)triangle_indices.size(), total_vertices);
+                fprintf(log_file, "[zachary]   Material %d: %d triangles, %d vertices\n", mat_idx, (int)triangle_indices.size(), total_vertices);
 
                 // Allocate position data
                 float* positions_data = (float*)arena_alloc_z(arena, sizeof(float) * 3 * total_vertices)->data;
@@ -493,7 +507,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
     int scene_count        = 0;
     {
         int total_scenes = BLI_listbase_count(&bmain->scenes);
-        printf("[zachary] Found %d scenes\n", total_scenes);
+        fprintf(log_file, "[zachary] Found %d scenes\n", total_scenes);
 
         scenes        = (BBArchiveScene*)arena_alloc_z(arena, sizeof(BBArchiveScene) * total_scenes)->data;
 
@@ -510,7 +524,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
             }
             FOREACH_SCENE_OBJECT_END;
 
-            printf("[zachary] Processing scene: %s (%d mesh objects)\n", scene->id.name, mesh_object_count);
+            fprintf(log_file, "[zachary] Processing scene: %s (%d mesh objects)\n", scene->id.name, mesh_object_count);
 
             BBArchiveSceneElem* elems = (BBArchiveSceneElem*)arena_alloc_z(arena, sizeof(BBArchiveSceneElem) * mesh_object_count)->data;
             int elem_idx              = 0;
@@ -522,11 +536,11 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 Mesh* mesh = (Mesh*)ob->data;
                 if (valid_meshes.find(mesh) == valid_meshes.end())
                 {
-                    printf("[zachary]   Skipping object: %s (mesh: %s - invalid mesh)\n", ob->id.name, mesh->id.name);
+                    fprintf(log_file, "[zachary]   Skipping object: %s (mesh: %s - invalid mesh)\n", ob->id.name, mesh->id.name);
                     continue;
                 }
 
-                printf("[zachary]   Processing object: %s (mesh: %s)\n", ob->id.name, mesh->id.name);
+                fprintf(log_file, "[zachary]   Processing object: %s (mesh: %s)\n", ob->id.name, mesh->id.name);
 
                 int mat_count = 0;
                 for (int i = 0; i < ob->totcol; i++)
@@ -560,7 +574,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
             scenes[scene_idx].scene_name = replace_prefix(arena, scene->id.name, "SC", "scene_");
             scenes[scene_idx].elem_count = elem_idx;
             scenes[scene_idx].elems      = elems;
-            printf("[zachary] Created scene: %s with %u elements\n", scenes[scene_idx].scene_name, scenes[scene_idx].elem_count);
+            fprintf(log_file, "[zachary] Created scene: %s with %u elements\n", scenes[scene_idx].scene_name, scenes[scene_idx].elem_count);
             scene_idx++;
         }
 
@@ -593,7 +607,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
             }
         }
 
-        printf("[zachary] Found %d packed images\n", total_image_count);
+        fprintf(log_file, "[zachary] Found %d packed images\n", total_image_count);
 
         images        = (BBArchiveImage*)arena_alloc_z(arena, sizeof(BBArchiveImage) * total_image_count)->data;
 
@@ -658,7 +672,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 bb_image.blob             = blob_data;
                 bb_image.blob_size        = blob_size;
 
-                printf("[zachary] Extracted rgba8 image: %s (%ux%u, %zu bytes)\n", bb_image.image_name, bb_image.width, bb_image.height, blob_size);
+                fprintf(log_file, "[zachary] Extracted rgba8 image: %s (%ux%u, %zu bytes)\n", bb_image.image_name, bb_image.width, bb_image.height, blob_size);
 
                 IMB_freeImBuf(ibuf);
                 image_idx++;
@@ -689,30 +703,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
         info.scenes             = scenes;
 
         bb_archive_write(&info, bb_archive_output_dir);
-        printf("[zachary] bb_archive_write completed\n");
-    }
-
-    // ===============================================================================================
-    // ===============================================================================================
-    // print meshes
-    // ===============================================================================================
-    // ===============================================================================================
-    {
-        FILE* fp = fopen("./dump.txt", "w");
-        if (fp == nullptr)
-        {
-            printf("Failed to open dump.txt for writing\n");
-            return;
-        }
-
-        fprintf(fp, "Meshes in file:\n");
-        LISTBASE_FOREACH(Mesh*, mesh, &bmain->meshes)
-        {
-            fprintf(fp, "  - %s (verts: %d, edges: %d, faces: %d)\n", mesh->id.name, mesh->verts_num, mesh->edges_num, mesh->faces_num);
-        }
-        fprintf(fp, "Total meshes: %d\n", BLI_listbase_count(&bmain->meshes));
-
-        fclose(fp);
+        fprintf(log_file, "[zachary] bb_archive_write completed\n");
     }
 
     // ===============================================================================================
@@ -723,14 +714,15 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
     {
         if (!invalid_mesh_names.empty())
         {
-            printf("[zachary] Invalid meshes skipped (empty material slots or no vertices):\n");
+            fprintf(log_file, "[zachary] Invalid meshes skipped (empty material slots or no vertices):\n");
             for (const char* mesh_name : invalid_mesh_names)
             {
-                printf("[zachary]   - %s\n", replace_prefix(arena, mesh_name, "ME", "mesh_"));
+                fprintf(log_file, "[zachary]   - %s\n", replace_prefix(arena, mesh_name, "ME", "mesh_"));
             }
-            printf("[zachary] Total invalid meshes: %d\n", (int)invalid_mesh_names.size());
+            fprintf(log_file, "[zachary] Total invalid meshes: %d\n", (int)invalid_mesh_names.size());
         }
     }
 
+    fclose(log_file);
     arena_destroy_z(arena);
 }
