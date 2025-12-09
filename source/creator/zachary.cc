@@ -1,6 +1,7 @@
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <unordered_set>
 #include <vector>
 
 #include "BLI_listbase.h"
@@ -49,7 +50,7 @@ static const char* replace_prefix(arena_zh arena, const char* name, const char* 
 
     if (strncmp(name, old_prefix, old_prefix_len) == 0)
     {
-        size_t buffer_size = name_len - old_prefix_len + new_prefix_len;
+        size_t buffer_size = name_len - old_prefix_len + new_prefix_len + 1;
         new_name           = (char*)arena_alloc_z(arena, buffer_size)->data;
         snprintf(new_name, buffer_size, "%s%s", new_prefix, name + old_prefix_len);
         processed_name = new_name;
@@ -119,7 +120,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
     // ===============================================================================================
     // ===============================================================================================
     std::vector<const char*> invalid_mesh_names;
-    std::vector<Mesh*> valid_meshes;
+    std::unordered_set<Mesh*> valid_meshes;
     {
         printf("[zachary] Validating .blend file...\n");
 
@@ -152,7 +153,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 continue;
             }
 
-            valid_meshes.push_back(mesh);
+            valid_meshes.insert(mesh);
         }
     }
 
@@ -330,13 +331,11 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
     BBArchiveScene* scenes = nullptr;
     int scene_count        = 0;
     {
-        // Count scenes and mesh objects per scene
         int total_scenes = BLI_listbase_count(&bmain->scenes);
         printf("[zachary] Found %d scenes\n", total_scenes);
 
         if (total_scenes > 0)
         {
-            // First pass: count mesh objects per scene
             std::vector<int> mesh_object_counts(total_scenes, 0);
             int scene_idx = 0;
             LISTBASE_FOREACH(Scene*, scene, &bmain->scenes)
@@ -345,14 +344,17 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 {
                     if (ob->type == OB_MESH && ob->data != nullptr)
                     {
-                        mesh_object_counts[scene_idx]++;
+                        Mesh* mesh = (Mesh*)ob->data;
+                        if (valid_meshes.find(mesh) != valid_meshes.end())
+                        {
+                            mesh_object_counts[scene_idx]++;
+                        }
                     }
                 }
                 FOREACH_SCENE_OBJECT_END;
                 scene_idx++;
             }
 
-            // Count total scenes with mesh objects
             int scenes_with_objects = 0;
             for (int count : mesh_object_counts)
             {
@@ -364,102 +366,101 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
 
             printf("[zachary] Found %d scenes with mesh objects\n", scenes_with_objects);
 
-            if (scenes_with_objects > 0)
-            {
-                // Allocate scenes array
-                scenes               = (BBArchiveScene*)arena_alloc_z(arena, sizeof(BBArchiveScene) * scenes_with_objects)->data;
+            // Allocate scenes array
+            scenes               = (BBArchiveScene*)arena_alloc_z(arena, sizeof(BBArchiveScene) * scenes_with_objects)->data;
 
-                scene_idx            = 0;
-                int output_scene_idx = 0;
-                LISTBASE_FOREACH(Scene*, scene, &bmain->scenes)
+            scene_idx            = 0;
+            int output_scene_idx = 0;
+            LISTBASE_FOREACH(Scene*, scene, &bmain->scenes)
+            {
+                int mesh_object_count = mesh_object_counts[scene_idx];
+                if (mesh_object_count == 0)
                 {
-                    int mesh_object_count = mesh_object_counts[scene_idx];
-                    if (mesh_object_count == 0)
+                    scene_idx++;
+                    continue;
+                }
+
+                printf("[zachary] Processing scene: %s (%d mesh objects)\n", scene->id.name, mesh_object_count);
+
+                // Allocate scene elements
+                BBArchiveSceneElem* elems = (BBArchiveSceneElem*)arena_alloc_z(arena, sizeof(BBArchiveSceneElem) * mesh_object_count)->data;
+
+                int elem_idx              = 0;
+                FOREACH_SCENE_OBJECT_BEGIN(scene, ob)
+                {
+                    if (ob->type != OB_MESH || ob->data == nullptr)
                     {
-                        scene_idx++;
                         continue;
                     }
 
-                    printf("[zachary] Processing scene: %s (%d mesh objects)\n", scene->id.name, mesh_object_count);
-
-                    // Allocate scene elements
-                    BBArchiveSceneElem* elems = (BBArchiveSceneElem*)arena_alloc_z(arena, sizeof(BBArchiveSceneElem) * mesh_object_count)->data;
-
-                    int elem_idx              = 0;
-                    FOREACH_SCENE_OBJECT_BEGIN(scene, ob)
+                    Mesh* mesh = (Mesh*)ob->data;
+                    if (valid_meshes.find(mesh) == valid_meshes.end())
                     {
-                        if (ob->type != OB_MESH || ob->data == nullptr)
-                        {
-                            continue;
-                        }
-
-                        Mesh* mesh = (Mesh*)ob->data;
-                        printf("[zachary]   Processing object: %s (mesh: %s)\n", ob->id.name, mesh->id.name);
-
-                        // Extract transform
-                        float pos[3]  = {ob->loc[0], ob->loc[1], ob->loc[2]};
-                        float rot[3]  = {ob->rot[0], ob->rot[1], ob->rot[2]};
-                        float sca[3]  = {ob->scale[0], ob->scale[1], ob->scale[2]};
-
-                        // Extract material names
-                        int mat_count = 0;
-                        for (int i = 0; i < ob->totcol; i++)
-                        {
-                            Material* mat = BKE_object_material_get(ob, i + 1);
-                            if (mat != nullptr)
-                            {
-                                mat_count++;
-                            }
-                        }
-
-                        const char** mat_names = nullptr;
-                        if (mat_count > 0)
-                        {
-                            mat_names   = (const char**)arena_alloc_z(arena, sizeof(const char*) * mat_count)->data;
-                            int mat_idx = 0;
-                            for (int i = 0; i < ob->totcol; i++)
-                            {
-                                Material* mat = BKE_object_material_get(ob, i + 1);
-                                if (mat != nullptr)
-                                {
-                                    mat_names[mat_idx] = replace_prefix(arena, mat->id.name, "MA", "mat_shad_");
-                                    mat_idx++;
-                                }
-                            }
-                        }
-
-                        // Create scene element
-                        BBArchiveSceneElem& elem = elems[elem_idx];
-                        elem.mesh_name           = replace_prefix(arena, mesh->id.name, "ME", "mesh_");
-                        elem.pos[0]              = pos[0];
-                        elem.pos[1]              = pos[1];
-                        elem.pos[2]              = pos[2];
-                        elem.rot[0]              = rot[0];
-                        elem.rot[1]              = rot[1];
-                        elem.rot[2]              = rot[2];
-                        elem.sca[0]              = sca[0];
-                        elem.sca[1]              = sca[1];
-                        elem.sca[2]              = sca[2];
-                        elem.mat_count           = mat_count;
-                        elem.mat_names           = mat_names;
-
-                        elem_idx++;
+                        printf("[zachary]   Skipping object: %s (mesh: %s - invalid mesh)\n", ob->id.name, mesh->id.name);
+                        continue;
                     }
-                    FOREACH_SCENE_OBJECT_END;
 
-                    // Create scene
-                    scenes[output_scene_idx].scene_name = scene->id.name;
-                    scenes[output_scene_idx].elem_count = mesh_object_count;
-                    scenes[output_scene_idx].elems      = elems;
+                    printf("[zachary]   Processing object: %s (mesh: %s)\n", ob->id.name, mesh->id.name);
 
-                    printf("[zachary] Created scene: %s with %u elements\n", scenes[output_scene_idx].scene_name, scenes[output_scene_idx].elem_count);
+                    // Extract transform
+                    float pos[3]  = {ob->loc[0], ob->loc[1], ob->loc[2]};
+                    float rot[3]  = {ob->rot[0], ob->rot[1], ob->rot[2]};
+                    float sca[3]  = {ob->scale[0], ob->scale[1], ob->scale[2]};
 
-                    output_scene_idx++;
-                    scene_idx++;
+                    // Extract material names
+                    int mat_count = 0;
+                    for (int i = 0; i < ob->totcol; i++)
+                    {
+                        Material* mat = BKE_object_material_get(ob, i + 1);
+                        if (mat != nullptr)
+                        {
+                            mat_count++;
+                        }
+                    }
+
+                    const char** mat_names = (const char**)arena_alloc_z(arena, sizeof(const char*) * mat_count)->data;
+                    int mat_idx            = 0;
+                    for (int i = 0; i < ob->totcol; i++)
+                    {
+                        Material* mat = BKE_object_material_get(ob, i + 1);
+                        if (mat != nullptr)
+                        {
+                            mat_names[mat_idx] = replace_prefix(arena, mat->id.name, "MA", "mat_shad_");
+                            mat_idx++;
+                        }
+                    }
+
+                    // Create scene element
+                    BBArchiveSceneElem& elem = elems[elem_idx];
+                    elem.mesh_name           = replace_prefix(arena, mesh->id.name, "ME", "mesh_");
+                    elem.pos[0]              = pos[0];
+                    elem.pos[1]              = pos[1];
+                    elem.pos[2]              = pos[2];
+                    elem.rot[0]              = rot[0];
+                    elem.rot[1]              = rot[1];
+                    elem.rot[2]              = rot[2];
+                    elem.sca[0]              = sca[0];
+                    elem.sca[1]              = sca[1];
+                    elem.sca[2]              = sca[2];
+                    elem.mat_count           = mat_count;
+                    elem.mat_names           = mat_names;
+
+                    elem_idx++;
                 }
+                FOREACH_SCENE_OBJECT_END;
 
-                scene_count = scenes_with_objects;
+                // Create scene
+                scenes[output_scene_idx].scene_name = replace_prefix(arena, scene->id.name, "SC", "scene_");
+                scenes[output_scene_idx].elem_count = elem_idx;
+                scenes[output_scene_idx].elems      = elems;
+
+                printf("[zachary] Created scene: %s with %u elements\n", scenes[output_scene_idx].scene_name, scenes[output_scene_idx].elem_count);
+
+                output_scene_idx++;
+                scene_idx++;
             }
+
+            scene_count = scenes_with_objects;
         }
     }
 
@@ -491,80 +492,77 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
 
         printf("[zachary] Found %d packed images\n", total_image_count);
 
-        if (total_image_count > 0)
-        {
-            images        = (BBArchiveImage*)arena_alloc_z(arena, sizeof(BBArchiveImage) * total_image_count)->data;
+        images        = (BBArchiveImage*)arena_alloc_z(arena, sizeof(BBArchiveImage) * total_image_count)->data;
 
-            int image_idx = 0;
-            LISTBASE_FOREACH(Image*, ima, &bmain->images)
+        int image_idx = 0;
+        LISTBASE_FOREACH(Image*, ima, &bmain->images)
+        {
+            if (!BKE_image_has_packedfile(ima))
             {
-                if (!BKE_image_has_packedfile(ima))
+                continue;
+            }
+
+            LISTBASE_FOREACH(ImagePackedFile*, imapf, &ima->packedfiles)
+            {
+                if (imapf->packedfile == nullptr)
                 {
                     continue;
                 }
 
-                LISTBASE_FOREACH(ImagePackedFile*, imapf, &ima->packedfiles)
+                int flag    = IB_byte_data | IB_metadata;
+                ImBuf* ibuf = IMB_load_image_from_memory((const unsigned char*)imapf->packedfile->data, imapf->packedfile->size, flag, "<packed data>", nullptr, ima->colorspace_settings.name);
+
+                if (ibuf == nullptr)
                 {
-                    if (imapf->packedfile == nullptr)
-                    {
-                        continue;
-                    }
+                    continue;
+                }
 
-                    int flag    = IB_byte_data | IB_metadata;
-                    ImBuf* ibuf = IMB_load_image_from_memory((const unsigned char*)imapf->packedfile->data, imapf->packedfile->size, flag, "<packed data>", nullptr, ima->colorspace_settings.name);
-
-                    if (ibuf == nullptr)
-                    {
-                        continue;
-                    }
-
-                    // Ensure byte buffer exists (convert from float if needed)
-                    if (ibuf->byte_buffer.data == nullptr && ibuf->float_buffer.data != nullptr)
-                    {
-                        if (!IMB_alloc_byte_pixels(ibuf, false))
-                        {
-                            IMB_freeImBuf(ibuf);
-                            continue;
-                        }
-                        IMB_byte_from_float(ibuf);
-                    }
-
-                    if (ibuf->byte_buffer.data == nullptr)
+                // Ensure byte buffer exists (convert from float if needed)
+                if (ibuf->byte_buffer.data == nullptr && ibuf->float_buffer.data != nullptr)
+                {
+                    if (!IMB_alloc_byte_pixels(ibuf, false))
                     {
                         IMB_freeImBuf(ibuf);
                         continue;
                     }
-
-                    // Extract rgba8 data
-                    size_t pixel_count = IMB_get_pixel_count(ibuf);
-                    size_t blob_size   = pixel_count * 4;
-                    uint8_t* blob_data = (uint8_t*)arena_alloc_z(arena, blob_size)->data;
-                    memcpy(blob_data, ibuf->byte_buffer.data, blob_size);
-
-                    char image_name[256];
-                    snprintf(image_name, sizeof(image_name), "%s", replace_prefix(arena, ima->id.name, "IM", "img_"));
-
-                    // Create BBArchiveImage
-                    BBArchiveImage& bb_image  = images[image_idx];
-                    bb_image.image_name       = arena_strdup_z(arena, image_name);
-                    bb_image.width            = ibuf->x;
-                    bb_image.height           = ibuf->y;
-                    bb_image.num_channels     = 4;
-                    bb_image.bits_per_channel = 8;
-                    bb_image.is_srgb          = IMB_colormanagement_space_is_srgb(ibuf->byte_buffer.colorspace);
-                    bb_image.mip_levels       = 1;
-                    bb_image.blob             = blob_data;
-                    bb_image.blob_size        = blob_size;
-
-                    printf("[zachary] Extracted rgba8 image: %s (%ux%u, %zu bytes)\n", bb_image.image_name, bb_image.width, bb_image.height, blob_size);
-
-                    IMB_freeImBuf(ibuf);
-                    image_idx++;
+                    IMB_byte_from_float(ibuf);
                 }
-            }
 
-            image_count = image_idx;
+                if (ibuf->byte_buffer.data == nullptr)
+                {
+                    IMB_freeImBuf(ibuf);
+                    continue;
+                }
+
+                // Extract rgba8 data
+                size_t pixel_count = IMB_get_pixel_count(ibuf);
+                size_t blob_size   = pixel_count * 4;
+                uint8_t* blob_data = (uint8_t*)arena_alloc_z(arena, blob_size)->data;
+                memcpy(blob_data, ibuf->byte_buffer.data, blob_size);
+
+                char image_name[256];
+                snprintf(image_name, sizeof(image_name), "%s", replace_prefix(arena, ima->id.name, "IM", "img_"));
+
+                // Create BBArchiveImage
+                BBArchiveImage& bb_image  = images[image_idx];
+                bb_image.image_name       = arena_strdup_z(arena, image_name);
+                bb_image.width            = ibuf->x;
+                bb_image.height           = ibuf->y;
+                bb_image.num_channels     = 4;
+                bb_image.bits_per_channel = 8;
+                bb_image.is_srgb          = IMB_colormanagement_space_is_srgb(ibuf->byte_buffer.colorspace);
+                bb_image.mip_levels       = 1;
+                bb_image.blob             = blob_data;
+                bb_image.blob_size        = blob_size;
+
+                printf("[zachary] Extracted rgba8 image: %s (%ux%u, %zu bytes)\n", bb_image.image_name, bb_image.width, bb_image.height, blob_size);
+
+                IMB_freeImBuf(ibuf);
+                image_idx++;
+            }
         }
+
+        image_count = image_idx;
     }
 
     // ===============================================================================================
