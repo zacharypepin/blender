@@ -291,6 +291,51 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
 
     // ===============================================================================================
     // ===============================================================================================
+    // dump data_t to log file
+    // ===============================================================================================
+    // ===============================================================================================
+    {
+        fprintf(log_file, "[zachary] === DATA DUMP ===\n");
+        fprintf(log_file, "[zachary] Scene count: %zu\n", data.scenes.size());
+
+        for (size_t scene_idx = 0; scene_idx < data.scenes.size(); scene_idx++)
+        {
+            const scene_t& scene = data.scenes[scene_idx];
+            fprintf(log_file, "[zachary]   Scene[%zu]: %s\n", scene_idx, scene.name.c_str());
+            fprintf(log_file, "[zachary]     Element count: %zu\n", scene.elems.size());
+
+            for (size_t elem_idx = 0; elem_idx < scene.elems.size(); elem_idx++)
+            {
+                const scene_elem_t& elem = scene.elems[elem_idx];
+                fprintf(log_file, "[zachary]       Elem[%zu]:\n", elem_idx);
+                fprintf(log_file, "[zachary]         pos: (%.4f, %.4f, %.4f)\n", elem.pos.x, elem.pos.y, elem.pos.z);
+                fprintf(log_file, "[zachary]         rot: (%.4f, %.4f, %.4f)\n", elem.euler_rot.x, elem.euler_rot.y, elem.euler_rot.z);
+                fprintf(log_file, "[zachary]         scale: (%.4f, %.4f, %.4f)\n", elem.scale.x, elem.scale.y, elem.scale.z);
+                fprintf(log_file, "[zachary]         mesh: %s\n", elem.mesh.name.c_str());
+                fprintf(log_file, "[zachary]           submesh count: %zu\n", elem.mesh.submeshes.size());
+
+                for (size_t submesh_idx = 0; submesh_idx < elem.mesh.submeshes.size(); submesh_idx++)
+                {
+                    const submesh_t& submesh = elem.mesh.submeshes[submesh_idx];
+                    fprintf(log_file, "[zachary]             Submesh[%zu]: material=%s, triangles=%zu\n", submesh_idx, submesh.material_name.c_str(), submesh.triangles.size());
+                }
+            }
+        }
+
+        if (!data.invalid_mesh_names.empty())
+        {
+            fprintf(log_file, "[zachary]   Invalid mesh names: %zu\n", data.invalid_mesh_names.size());
+            for (const std::string& name : data.invalid_mesh_names)
+            {
+                fprintf(log_file, "[zachary]     - %s\n", name.c_str());
+            }
+        }
+
+        fprintf(log_file, "[zachary] === END DATA DUMP ===\n");
+    }
+
+    // ===============================================================================================
+    // ===============================================================================================
     // Validate .blend file
     // ===============================================================================================
     // ===============================================================================================
