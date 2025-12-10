@@ -6,6 +6,7 @@
 #include <functional>
 #include <map>
 #include <optional>
+#include <set>
 #include <unordered_map>
 #include <vector>
 
@@ -408,10 +409,88 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
             material_t material_data;
             material_data.name = mat->id.name;
 
-            std::map<std::string, socket_endpoint_t> input_mappings;
-            std::map<std::string, socket_endpoint_t> output_mappings;
+            // Flatten tree
+            {
+                std::map<std::string, socket_endpoint_t> input_mappings;
+                std::map<std::string, socket_endpoint_t> output_mappings;
 
-            flatten_node_tree(mat->nodetree, "", material_data, input_mappings, output_mappings);
+                flatten_node_tree(mat->nodetree, "", material_data, input_mappings, output_mappings);
+            }
+
+            // Find Principled BSDF node, skip material if not found
+            std::optional<std::string> principled_node_name;
+            {
+                for (const auto& node : material_data.nodes)
+                {
+                    if (node.idname == "ShaderNodeBsdfPrincipled")
+                    {
+                        principled_node_name = node.name;
+                        break;
+                    }
+                }
+                if (!principled_node_name.has_value())
+                {
+                    fprintf(log_file, "[zachary] Skipping material %s (no Principled BSDF)\n", mat->id.name);
+                    continue;
+                }
+            }
+
+            // Build reverse adjacency: for each node, which nodes feed into it
+            std::map<std::string, std::vector<std::string>> reverse_adj;
+            {
+                for (const auto& link : material_data.links)
+                {
+                    reverse_adj[link.to_node].push_back(link.from_node);
+                }
+            }
+
+            // BFS backwards from Principled BSDF to find all contributing nodes
+            std::set<std::string> reachable_nodes;
+            {
+                std::vector<std::string> queue;
+                queue.push_back(principled_node_name.value());
+                reachable_nodes.insert(principled_node_name.value());
+                while (!queue.empty())
+                {
+                    std::string current = queue.back();
+                    queue.pop_back();
+                    for (const auto& pred : reverse_adj[current])
+                    {
+                        if (reachable_nodes.find(pred) == reachable_nodes.end())
+                        {
+                            reachable_nodes.insert(pred);
+                            queue.push_back(pred);
+                        }
+                    }
+                }
+            }
+
+            // Filter nodes to only those reachable
+            std::vector<shader_node_t> filtered_nodes;
+            {
+                for (auto& node : material_data.nodes)
+                {
+                    if (reachable_nodes.count(node.name))
+                    {
+                        filtered_nodes.push_back(std::move(node));
+                    }
+                }
+            }
+
+            // Filter links to only those between reachable nodes
+            std::vector<shader_link_t> filtered_links;
+            {
+                for (auto& link : material_data.links)
+                {
+                    if (reachable_nodes.count(link.from_node) && reachable_nodes.count(link.to_node))
+                    {
+                        filtered_links.push_back(std::move(link));
+                    }
+                }
+            }
+
+            material_data.nodes                = std::move(filtered_nodes);
+            material_data.links                = std::move(filtered_links);
 
             data.materials[material_data.name] = std::move(material_data);
         }
