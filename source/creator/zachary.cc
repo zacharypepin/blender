@@ -8,6 +8,7 @@
 #include <optional>
 #include <set>
 #include <unordered_map>
+#include <variant>
 #include <vector>
 
 #include "BLI_listbase.h"
@@ -110,10 +111,34 @@ namespace
         bool is_srgb;
     };
 
+    struct socket_value_float_t
+    {
+        float value;
+    };
+    struct socket_value_int_t
+    {
+        int value;
+    };
+    struct socket_value_bool_t
+    {
+        bool value;
+    };
+    struct socket_value_vector_t
+    {
+        float x, y, z;
+    };
+    struct socket_value_rgba_t
+    {
+        float r, g, b, a;
+    };
+
+    using socket_default_value_t = std::variant<socket_value_float_t, socket_value_int_t, socket_value_bool_t, socket_value_vector_t, socket_value_rgba_t>;
+
     struct shader_node_socket_t
     {
         std::string identifier;
         std::string idname; // e.g. "NodeSocketColor", "NodeSocketFloat"
+        std::optional<socket_default_value_t> default_value;
     };
 
     struct shader_node_t
@@ -352,6 +377,39 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 }
                 else
                 {
+                    auto extract_default_value = [](bNodeSocket* socket) -> std::optional<socket_default_value_t>
+                    {
+                        if (socket->default_value == nullptr) return std::nullopt;
+
+                        if (strncmp(socket->idname, "NodeSocketFloat", 15) == 0)
+                        {
+                            auto* val = static_cast<bNodeSocketValueFloat*>(socket->default_value);
+                            return socket_value_float_t{val->value};
+                        }
+                        else if (strncmp(socket->idname, "NodeSocketInt", 13) == 0)
+                        {
+                            auto* val = static_cast<bNodeSocketValueInt*>(socket->default_value);
+                            return socket_value_int_t{val->value};
+                        }
+                        else if (strcmp(socket->idname, "NodeSocketBool") == 0)
+                        {
+                            auto* val = static_cast<bNodeSocketValueBoolean*>(socket->default_value);
+                            return socket_value_bool_t{val->value != 0};
+                        }
+                        else if (strncmp(socket->idname, "NodeSocketVector", 16) == 0)
+                        {
+                            auto* val = static_cast<bNodeSocketValueVector*>(socket->default_value);
+                            return socket_value_vector_t{val->value[0], val->value[1], val->value[2]};
+                        }
+                        else if (strcmp(socket->idname, "NodeSocketColor") == 0)
+                        {
+                            auto* val = static_cast<bNodeSocketValueRGBA*>(socket->default_value);
+                            return socket_value_rgba_t{val->value[0], val->value[1], val->value[2], val->value[3]};
+                        }
+
+                        return std::nullopt;
+                    };
+
                     shader_node_t node_data;
                     node_data.name   = prefix + node->name;
                     node_data.idname = node->idname;
@@ -360,8 +418,9 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                     LISTBASE_FOREACH(bNodeSocket*, socket, &node->inputs)
                     {
                         shader_node_socket_t socket_data;
-                        socket_data.identifier = socket->identifier;
-                        socket_data.idname     = socket->idname;
+                        socket_data.identifier    = socket->identifier;
+                        socket_data.idname        = socket->idname;
+                        socket_data.default_value = extract_default_value(socket);
                         node_data.inputs.push_back(socket_data);
                     }
 
@@ -369,8 +428,9 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                     LISTBASE_FOREACH(bNodeSocket*, socket, &node->outputs)
                     {
                         shader_node_socket_t socket_data;
-                        socket_data.identifier = socket->identifier;
-                        socket_data.idname     = socket->idname;
+                        socket_data.identifier    = socket->identifier;
+                        socket_data.idname        = socket->idname;
+                        socket_data.default_value = extract_default_value(socket);
                         node_data.outputs.push_back(socket_data);
                     }
 
@@ -997,13 +1057,30 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
             {
                 const auto& node = mat.nodes[i];
                 fprintf(log_file, "    node[%zu]: %s [%s] (inputs=%zu, outputs=%zu)\n", i, node.name.c_str(), node.idname.c_str(), node.inputs.size(), node.outputs.size());
+                auto format_default_value = [](const std::optional<socket_default_value_t>& val) -> std::string
+                {
+                    if (!val.has_value()) return "";
+                    return std::visit(
+                        [](auto&& v) -> std::string
+                        {
+                            using T = std::decay_t<decltype(v)>;
+                            if constexpr (std::is_same_v<T, socket_value_float_t>) return " = " + std::to_string(v.value);
+                            else if constexpr (std::is_same_v<T, socket_value_int_t>) return " = " + std::to_string(v.value);
+                            else if constexpr (std::is_same_v<T, socket_value_bool_t>) return std::string(" = ") + (v.value ? "true" : "false");
+                            else if constexpr (std::is_same_v<T, socket_value_vector_t>) return " = (" + std::to_string(v.x) + ", " + std::to_string(v.y) + ", " + std::to_string(v.z) + ")";
+                            else if constexpr (std::is_same_v<T, socket_value_rgba_t>) return " = (" + std::to_string(v.r) + ", " + std::to_string(v.g) + ", " + std::to_string(v.b) + ", " + std::to_string(v.a) + ")";
+                            else return "";
+                        },
+                        val.value()
+                    );
+                };
                 for (const auto& input : node.inputs)
                 {
-                    fprintf(log_file, "      in: %s (%s)\n", input.identifier.c_str(), input.idname.c_str());
+                    fprintf(log_file, "      in: %s (%s)%s\n", input.identifier.c_str(), input.idname.c_str(), format_default_value(input.default_value).c_str());
                 }
                 for (const auto& output : node.outputs)
                 {
-                    fprintf(log_file, "      out: %s (%s)\n", output.identifier.c_str(), output.idname.c_str());
+                    fprintf(log_file, "      out: %s (%s)%s\n", output.identifier.c_str(), output.idname.c_str(), format_default_value(output.default_value).c_str());
                 }
             }
             for (const auto& link : mat.links)
