@@ -133,12 +133,16 @@ namespace
     {
         float r, g, b, a;
     };
-    struct socket_value_string_t
+    struct socket_value_tex_t
+    {
+        std::string value;
+    };
+    struct socket_value_uv_map_t
     {
         std::string value;
     };
 
-    using socket_default_value_t = std::variant<socket_value_float_t, socket_value_int_t, socket_value_bool_t, socket_value_vector_t, socket_value_rgba_t, socket_value_string_t>;
+    using socket_default_value_t = std::variant<socket_value_float_t, socket_value_int_t, socket_value_bool_t, socket_value_vector_t, socket_value_rgba_t, socket_value_tex_t, socket_value_uv_map_t>;
 
     struct shader_node_socket_t
     {
@@ -469,11 +473,18 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                         p.value      = socket_value_float_t{val};
                         node_data.props.push_back(p);
                     };
-                    auto add_string_prop = [&](const char* id, const std::string& val)
+                    auto add_tex_prop = [&](const char* id, const std::string& val)
                     {
                         shader_node_prop_t p;
                         p.identifier = id;
-                        p.value      = socket_value_string_t{val};
+                        p.value      = socket_value_tex_t{val};
+                        node_data.props.push_back(p);
+                    };
+                    auto add_uv_map_prop = [&](const char* id, const std::string& val)
+                    {
+                        shader_node_prop_t p;
+                        p.identifier = id;
+                        p.value      = socket_value_uv_map_t{val};
                         node_data.props.push_back(p);
                     };
                     auto add_rgba_prop = [&](const char* id, float r, float g, float b, float a)
@@ -487,7 +498,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                     if (strcmp(node->idname, "ShaderNodeUVMap") == 0)
                     {
                         NodeShaderUVMap* data = (NodeShaderUVMap*)node->storage;
-                        if (data) add_string_prop("uv_map", data->uv_map);
+                        if (data) add_uv_map_prop("uv_map", data->uv_map);
                     }
                     else if (strcmp(node->idname, "ShaderNodeMath") == 0)
                     {
@@ -530,7 +541,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                         if (node->id != nullptr)
                         {
                             Image* ima = (Image*)node->id;
-                            add_string_prop("image", ima->id.name);
+                            add_tex_prop("image", ima->id.name);
                         }
                         NodeTexImage* data = (NodeTexImage*)node->storage;
                         if (data)
@@ -592,7 +603,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                         if (data)
                         {
                             add_int_prop("space", data->space);
-                            add_string_prop("uv_map", data->uv_map);
+                            add_uv_map_prop("uv_map", data->uv_map);
                         }
                     }
                     else if (strcmp(node->idname, "ShaderNodeTangent") == 0)
@@ -602,7 +613,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                         {
                             add_int_prop("direction_type", data->direction_type);
                             add_int_prop("axis", data->axis);
-                            add_string_prop("uv_map", data->uv_map);
+                            add_uv_map_prop("uv_map", data->uv_map);
                         }
                     }
                     else if (strcmp(node->idname, "ShaderNodeTexBrick") == 0)
@@ -621,7 +632,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                         if (node->id != nullptr)
                         {
                             Image* ima = (Image*)node->id;
-                            add_string_prop("image", ima->id.name);
+                            add_tex_prop("image", ima->id.name);
                         }
                         NodeTexEnvironment* data = (NodeTexEnvironment*)node->storage;
                         if (data)
@@ -1473,7 +1484,8 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                             else if constexpr (std::is_same_v<T, socket_value_bool_t>) return std::string(" = ") + (v.value ? "true" : "false");
                             else if constexpr (std::is_same_v<T, socket_value_vector_t>) return " = (" + std::to_string(v.x) + ", " + std::to_string(v.y) + ", " + std::to_string(v.z) + ")";
                             else if constexpr (std::is_same_v<T, socket_value_rgba_t>) return " = (" + std::to_string(v.r) + ", " + std::to_string(v.g) + ", " + std::to_string(v.b) + ", " + std::to_string(v.a) + ")";
-                            else if constexpr (std::is_same_v<T, socket_value_string_t>) return " = \"" + v.value + "\"";
+                            else if constexpr (std::is_same_v<T, socket_value_tex_t>) return " = \"" + v.value + "\"";
+                            else if constexpr (std::is_same_v<T, socket_value_uv_map_t>) return " = \"" + v.value + "\"";
                             else return "";
                         },
                         val.value()
@@ -1498,7 +1510,8 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                             else if constexpr (std::is_same_v<T, socket_value_bool_t>) return v.value ? "true" : "false";
                             else if constexpr (std::is_same_v<T, socket_value_vector_t>) return "(" + std::to_string(v.x) + ", " + std::to_string(v.y) + ", " + std::to_string(v.z) + ")";
                             else if constexpr (std::is_same_v<T, socket_value_rgba_t>) return "(" + std::to_string(v.r) + ", " + std::to_string(v.g) + ", " + std::to_string(v.b) + ", " + std::to_string(v.a) + ")";
-                            else if constexpr (std::is_same_v<T, socket_value_string_t>) return "\"" + v.value + "\"";
+                            else if constexpr (std::is_same_v<T, socket_value_tex_t>) return "\"" + v.value + "\"";
+                            else if constexpr (std::is_same_v<T, socket_value_uv_map_t>) return "\"" + v.value + "\"";
                             else return "";
                         },
                         prop.value
@@ -2492,9 +2505,14 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                         field.vec4_val[2] = v.b;
                         field.vec4_val[3] = v.a;
                     }
-                    else if constexpr (std::is_same_v<T, socket_value_string_t>)
+                    else if constexpr (std::is_same_v<T, socket_value_tex_t>)
                     {
                         field.value_type = BB_SHADER_VALUE_TYPE_TEX;
+                        field.str_val    = normalize_string(v.value);
+                    }
+                    else if constexpr (std::is_same_v<T, socket_value_uv_map_t>)
+                    {
+                        field.value_type = BB_SHADER_VALUE_TYPE_UV_MAP;
                         field.str_val    = normalize_string(v.value);
                     }
                 },
@@ -2647,14 +2665,40 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 memcpy(bb_links, links.data(), sizeof(BBArchiveShaderLink) * links.size());
             }
 
+            // Collect mat_data: all string fields (TEX and UV_MAP types)
+            std::vector<BBArchiveShaderMatData> mat_data_vec;
+            for (uint32_t node_idx = 0; node_idx < valid_nodes.size(); node_idx++)
+            {
+                const BBArchiveShaderNode& node = bb_nodes[node_idx];
+                for (uint32_t field_idx = 0; field_idx < node.field_count; field_idx++)
+                {
+                    const BBArchiveShaderField& field = node.fields[field_idx];
+                    if (field.value_type == BB_SHADER_VALUE_TYPE_TEX || field.value_type == BB_SHADER_VALUE_TYPE_UV_MAP)
+                    {
+                        BBArchiveShaderMatData mat_data_entry;
+                        mat_data_entry.node_idx = node_idx;
+                        mat_data_entry.field    = field;
+                        mat_data_vec.push_back(mat_data_entry);
+                    }
+                }
+            }
+
+            // Allocate and copy mat_data
+            BBArchiveShaderMatData* bb_mat_data = nullptr;
+            if (!mat_data_vec.empty())
+            {
+                bb_mat_data = (BBArchiveShaderMatData*)arena_alloc_z(arena, sizeof(BBArchiveShaderMatData) * mat_data_vec.size())->data;
+                memcpy(bb_mat_data, mat_data_vec.data(), sizeof(BBArchiveShaderMatData) * mat_data_vec.size());
+            }
+
             BBArchiveShaderGraph shader_graph;
             shader_graph.shader_name    = normalize_string(mat.name);
             shader_graph.node_count     = valid_nodes.size();
             shader_graph.nodes          = bb_nodes;
             shader_graph.link_count     = links.size();
             shader_graph.links          = bb_links;
-            shader_graph.mat_data_count = 0;
-            shader_graph.mat_data       = nullptr;
+            shader_graph.mat_data_count = mat_data_vec.size();
+            shader_graph.mat_data       = bb_mat_data;
 
             bb_shaders.push_back(shader_graph);
         }
