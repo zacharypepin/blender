@@ -1850,6 +1850,89 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
             {
                 if (socket_id == "Color") return BB_SHADER_INPUT_FIELD_RGB_COLOR;
             }
+            // UV Map
+            if (node_type == BB_SHADER_NODE_TYPE_UV_MAP)
+            {
+                if (socket_id == "UV") return BB_SHADER_INPUT_FIELD_UV_MAP_UV;
+            }
+            // Tex Environment
+            if (node_type == BB_SHADER_NODE_TYPE_TEX_ENVIRONMENT)
+            {
+                if (socket_id == "Vector") return BB_SHADER_INPUT_FIELD_TEX_ENVIRONMENT_VECTOR;
+            }
+            // Tex Gabor
+            if (node_type == BB_SHADER_NODE_TYPE_TEX_GABOR)
+            {
+                if (socket_id == "Vector") return BB_SHADER_INPUT_FIELD_TEX_GABOR_VECTOR;
+                if (socket_id == "Scale") return BB_SHADER_INPUT_FIELD_TEX_GABOR_SCALE;
+                if (socket_id == "Frequency") return BB_SHADER_INPUT_FIELD_TEX_GABOR_FREQUENCY;
+                if (socket_id == "Anisotropy") return BB_SHADER_INPUT_FIELD_TEX_GABOR_ANISOTROPY;
+                if (socket_id == "Orientation 2D") return BB_SHADER_INPUT_FIELD_TEX_GABOR_ORIENTATION_2D;
+                if (socket_id == "Orientation 3D") return BB_SHADER_INPUT_FIELD_TEX_GABOR_ORIENTATION_3D;
+            }
+            // Tex Gradient
+            if (node_type == BB_SHADER_NODE_TYPE_TEX_GRADIENT)
+            {
+                if (socket_id == "Vector") return BB_SHADER_INPUT_FIELD_TEX_GRADIENT_VECTOR;
+            }
+            // Tex Magic
+            if (node_type == BB_SHADER_NODE_TYPE_TEX_MAGIC)
+            {
+                if (socket_id == "Vector") return BB_SHADER_INPUT_FIELD_TEX_MAGIC_VECTOR;
+                if (socket_id == "Scale") return BB_SHADER_INPUT_FIELD_TEX_MAGIC_SCALE;
+                if (socket_id == "Distortion") return BB_SHADER_INPUT_FIELD_TEX_MAGIC_DISTORTION;
+            }
+            // Tex Voronoi
+            if (node_type == BB_SHADER_NODE_TYPE_TEX_VORONOI)
+            {
+                if (socket_id == "Vector") return BB_SHADER_INPUT_FIELD_TEX_VORONOI_VECTOR;
+                if (socket_id == "W") return BB_SHADER_INPUT_FIELD_TEX_VORONOI_W;
+                if (socket_id == "Scale") return BB_SHADER_INPUT_FIELD_TEX_VORONOI_SCALE;
+                if (socket_id == "Detail") return BB_SHADER_INPUT_FIELD_TEX_VORONOI_DETAIL;
+                if (socket_id == "Roughness") return BB_SHADER_INPUT_FIELD_TEX_VORONOI_ROUGHNESS;
+                if (socket_id == "Lacunarity") return BB_SHADER_INPUT_FIELD_TEX_VORONOI_LACUNARITY;
+                if (socket_id == "Smoothness") return BB_SHADER_INPUT_FIELD_TEX_VORONOI_SMOOTHNESS;
+                if (socket_id == "Exponent") return BB_SHADER_INPUT_FIELD_TEX_VORONOI_EXPONENT;
+                if (socket_id == "Randomness") return BB_SHADER_INPUT_FIELD_TEX_VORONOI_RANDOMNESS;
+            }
+            // Tex Wave
+            if (node_type == BB_SHADER_NODE_TYPE_TEX_WAVE)
+            {
+                if (socket_id == "Vector") return BB_SHADER_INPUT_FIELD_TEX_WAVE_VECTOR;
+                if (socket_id == "Scale") return BB_SHADER_INPUT_FIELD_TEX_WAVE_SCALE;
+                if (socket_id == "Distortion") return BB_SHADER_INPUT_FIELD_TEX_WAVE_DISTORTION;
+                if (socket_id == "Detail") return BB_SHADER_INPUT_FIELD_TEX_WAVE_DETAIL;
+                if (socket_id == "Detail Scale") return BB_SHADER_INPUT_FIELD_TEX_WAVE_DETAIL_SCALE;
+                if (socket_id == "Detail Roughness") return BB_SHADER_INPUT_FIELD_TEX_WAVE_DETAIL_ROUGHNESS;
+                if (socket_id == "Phase Offset") return BB_SHADER_INPUT_FIELD_TEX_WAVE_PHASE_OFFSET;
+            }
+            // Tex White Noise
+            if (node_type == BB_SHADER_NODE_TYPE_TEX_WHITE_NOISE)
+            {
+                if (socket_id == "Vector") return BB_SHADER_INPUT_FIELD_TEX_WHITE_NOISE_VECTOR;
+                if (socket_id == "W") return BB_SHADER_INPUT_FIELD_TEX_WHITE_NOISE_W;
+            }
+            // Vector Displacement
+            if (node_type == BB_SHADER_NODE_TYPE_VECTOR_DISPLACEMENT)
+            {
+                if (socket_id == "Vector") return BB_SHADER_INPUT_FIELD_VECTOR_DISPLACEMENT_VECTOR;
+                if (socket_id == "Midlevel") return BB_SHADER_INPUT_FIELD_VECTOR_DISPLACEMENT_MIDLEVEL;
+                if (socket_id == "Scale") return BB_SHADER_INPUT_FIELD_VECTOR_DISPLACEMENT_SCALE;
+            }
+            // Vector Rotate
+            if (node_type == BB_SHADER_NODE_TYPE_VECTOR_ROTATE)
+            {
+                if (socket_id == "Vector") return BB_SHADER_INPUT_FIELD_VECTOR_ROTATE_VECTOR;
+                if (socket_id == "Center") return BB_SHADER_INPUT_FIELD_VECTOR_ROTATE_CENTER;
+                if (socket_id == "Axis") return BB_SHADER_INPUT_FIELD_VECTOR_ROTATE_AXIS;
+                if (socket_id == "Angle") return BB_SHADER_INPUT_FIELD_VECTOR_ROTATE_ANGLE;
+                if (socket_id == "Rotation") return BB_SHADER_INPUT_FIELD_VECTOR_ROTATE_ROTATION;
+            }
+            // Vector Transform
+            if (node_type == BB_SHADER_NODE_TYPE_VECTOR_TRANSFORM)
+            {
+                if (socket_id == "Vector") return BB_SHADER_INPUT_FIELD_VECTOR_TRANSFORM_VECTOR;
+            }
             return std::nullopt;
         };
 
@@ -2021,6 +2104,66 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
             {
                 if (socket_id == "Color") return BB_SHADER_OUTPUT_FIELD_RGB_COLOR;
             }
+            // Tex Environment
+            if (node_type == BB_SHADER_NODE_TYPE_TEX_ENVIRONMENT)
+            {
+                if (socket_id == "Color") return BB_SHADER_OUTPUT_FIELD_TEX_ENVIRONMENT_COLOR;
+            }
+            // Tex Gabor
+            if (node_type == BB_SHADER_NODE_TYPE_TEX_GABOR)
+            {
+                if (socket_id == "Value") return BB_SHADER_OUTPUT_FIELD_TEX_GABOR_VALUE;
+                if (socket_id == "Phase") return BB_SHADER_OUTPUT_FIELD_TEX_GABOR_PHASE;
+                if (socket_id == "Intensity") return BB_SHADER_OUTPUT_FIELD_TEX_GABOR_INTENSITY;
+            }
+            // Tex Gradient
+            if (node_type == BB_SHADER_NODE_TYPE_TEX_GRADIENT)
+            {
+                if (socket_id == "Color") return BB_SHADER_OUTPUT_FIELD_TEX_GRADIENT_COLOR;
+                if (socket_id == "Fac") return BB_SHADER_OUTPUT_FIELD_TEX_GRADIENT_FAC;
+            }
+            // Tex Magic
+            if (node_type == BB_SHADER_NODE_TYPE_TEX_MAGIC)
+            {
+                if (socket_id == "Color") return BB_SHADER_OUTPUT_FIELD_TEX_MAGIC_COLOR;
+                if (socket_id == "Fac") return BB_SHADER_OUTPUT_FIELD_TEX_MAGIC_FAC;
+            }
+            // Tex Voronoi
+            if (node_type == BB_SHADER_NODE_TYPE_TEX_VORONOI)
+            {
+                if (socket_id == "Distance") return BB_SHADER_OUTPUT_FIELD_TEX_VORONOI_DISTANCE;
+                if (socket_id == "Color") return BB_SHADER_OUTPUT_FIELD_TEX_VORONOI_COLOR;
+                if (socket_id == "Position") return BB_SHADER_OUTPUT_FIELD_TEX_VORONOI_POSITION;
+                if (socket_id == "W") return BB_SHADER_OUTPUT_FIELD_TEX_VORONOI_W;
+                if (socket_id == "Radius") return BB_SHADER_OUTPUT_FIELD_TEX_VORONOI_RADIUS;
+            }
+            // Tex Wave
+            if (node_type == BB_SHADER_NODE_TYPE_TEX_WAVE)
+            {
+                if (socket_id == "Color") return BB_SHADER_OUTPUT_FIELD_TEX_WAVE_COLOR;
+                if (socket_id == "Fac") return BB_SHADER_OUTPUT_FIELD_TEX_WAVE_FAC;
+            }
+            // Tex White Noise
+            if (node_type == BB_SHADER_NODE_TYPE_TEX_WHITE_NOISE)
+            {
+                if (socket_id == "Value") return BB_SHADER_OUTPUT_FIELD_TEX_WHITE_NOISE_VALUE;
+                if (socket_id == "Color") return BB_SHADER_OUTPUT_FIELD_TEX_WHITE_NOISE_COLOR;
+            }
+            // Vector Displacement
+            if (node_type == BB_SHADER_NODE_TYPE_VECTOR_DISPLACEMENT)
+            {
+                if (socket_id == "Displacement") return BB_SHADER_OUTPUT_FIELD_VECTOR_DISPLACEMENT_DISPLACEMENT;
+            }
+            // Vector Rotate
+            if (node_type == BB_SHADER_NODE_TYPE_VECTOR_ROTATE)
+            {
+                if (socket_id == "Vector") return BB_SHADER_OUTPUT_FIELD_VECTOR_ROTATE_VECTOR;
+            }
+            // Vector Transform
+            if (node_type == BB_SHADER_NODE_TYPE_VECTOR_TRANSFORM)
+            {
+                if (socket_id == "Vector") return BB_SHADER_OUTPUT_FIELD_VECTOR_TRANSFORM_VECTOR;
+            }
             return std::nullopt;
         };
 
@@ -2131,6 +2274,60 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 if (prop_id == "offset_frequency") return BB_SHADER_INPUT_FIELD_TEX_BRICK_OFFSET_FREQUENCY;
                 if (prop_id == "squash") return BB_SHADER_INPUT_FIELD_TEX_BRICK_SQUASH;
                 if (prop_id == "squash_frequency") return BB_SHADER_INPUT_FIELD_TEX_BRICK_SQUASH_FREQUENCY;
+            }
+            if (node_type == BB_SHADER_NODE_TYPE_TEX_ENVIRONMENT)
+            {
+                if (prop_id == "interpolation") return BB_SHADER_INPUT_FIELD_TEX_ENVIRONMENT_INTERPOLATION;
+                if (prop_id == "projection") return BB_SHADER_INPUT_FIELD_TEX_ENVIRONMENT_PROJECTION;
+                if (prop_id == "image") return BB_SHADER_INPUT_FIELD_TEX_ENVIRONMENT_IMAGE;
+            }
+            if (node_type == BB_SHADER_NODE_TYPE_TEX_GABOR)
+            {
+                if (prop_id == "gabor_type") return BB_SHADER_INPUT_FIELD_TEX_GABOR_GABOR_TYPE;
+            }
+            if (node_type == BB_SHADER_NODE_TYPE_TEX_GRADIENT)
+            {
+                if (prop_id == "gradient_type") return BB_SHADER_INPUT_FIELD_TEX_GRADIENT_GRADIENT_TYPE;
+            }
+            if (node_type == BB_SHADER_NODE_TYPE_TEX_MAGIC)
+            {
+                if (prop_id == "turbulence_depth") return BB_SHADER_INPUT_FIELD_TEX_MAGIC_TURBULENCE_DEPTH;
+            }
+            if (node_type == BB_SHADER_NODE_TYPE_TEX_VORONOI)
+            {
+                if (prop_id == "voronoi_dimensions") return BB_SHADER_INPUT_FIELD_TEX_VORONOI_VORONOI_DIMENSIONS;
+                if (prop_id == "feature") return BB_SHADER_INPUT_FIELD_TEX_VORONOI_FEATURE;
+                if (prop_id == "distance") return BB_SHADER_INPUT_FIELD_TEX_VORONOI_DISTANCE;
+            }
+            if (node_type == BB_SHADER_NODE_TYPE_TEX_WAVE)
+            {
+                if (prop_id == "wave_type") return BB_SHADER_INPUT_FIELD_TEX_WAVE_WAVE_TYPE;
+                if (prop_id == "bands_direction") return BB_SHADER_INPUT_FIELD_TEX_WAVE_BANDS_DIRECTION;
+                if (prop_id == "rings_direction") return BB_SHADER_INPUT_FIELD_TEX_WAVE_RINGS_DIRECTION;
+                if (prop_id == "wave_profile") return BB_SHADER_INPUT_FIELD_TEX_WAVE_WAVE_PROFILE;
+            }
+            if (node_type == BB_SHADER_NODE_TYPE_TEX_WHITE_NOISE)
+            {
+                if (prop_id == "noise_dimensions") return BB_SHADER_INPUT_FIELD_TEX_WHITE_NOISE_NOISE_DIMENSIONS;
+            }
+            if (node_type == BB_SHADER_NODE_TYPE_VECTOR_DISPLACEMENT)
+            {
+                if (prop_id == "space") return BB_SHADER_INPUT_FIELD_VECTOR_DISPLACEMENT_SPACE;
+            }
+            if (node_type == BB_SHADER_NODE_TYPE_VECTOR_ROTATE)
+            {
+                if (prop_id == "rotation_type") return BB_SHADER_INPUT_FIELD_VECTOR_ROTATE_ROTATION_TYPE;
+                if (prop_id == "invert") return BB_SHADER_INPUT_FIELD_VECTOR_ROTATE_INVERT;
+            }
+            if (node_type == BB_SHADER_NODE_TYPE_VECTOR_TRANSFORM)
+            {
+                if (prop_id == "vector_type") return BB_SHADER_INPUT_FIELD_VECTOR_TRANSFORM_VECTOR_TYPE;
+                if (prop_id == "convert_from") return BB_SHADER_INPUT_FIELD_VECTOR_TRANSFORM_CONVERT_FROM;
+                if (prop_id == "convert_to") return BB_SHADER_INPUT_FIELD_VECTOR_TRANSFORM_CONVERT_TO;
+            }
+            if (node_type == BB_SHADER_NODE_TYPE_UV_MAP)
+            {
+                if (prop_id == "uv_map") return BB_SHADER_INPUT_FIELD_UV_MAP_UV;
             }
             return std::nullopt;
         };
