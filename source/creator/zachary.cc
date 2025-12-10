@@ -21,7 +21,6 @@
 #include "DNA_image_types.h"
 #include "DNA_material_types.h"
 #include "DNA_mesh_types.h"
-#include "DNA_meshdata_types.h"
 #include "DNA_node_types.h"
 #include "DNA_object_types.h"
 #include "DNA_packedFile_types.h"
@@ -617,6 +616,88 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                             add_int_prop("squash_frequency", data->squash_freq);
                         }
                     }
+                    else if (strcmp(node->idname, "ShaderNodeTexEnvironment") == 0)
+                    {
+                        if (node->id != nullptr)
+                        {
+                            Image* ima = (Image*)node->id;
+                            add_string_prop("image", ima->id.name);
+                        }
+                        NodeTexEnvironment* data = (NodeTexEnvironment*)node->storage;
+                        if (data)
+                        {
+                            add_int_prop("interpolation", data->interpolation);
+                            add_int_prop("projection", data->projection);
+                        }
+                    }
+                    else if (strcmp(node->idname, "ShaderNodeTexGabor") == 0)
+                    {
+                        NodeTexGabor* data = (NodeTexGabor*)node->storage;
+                        if (data)
+                        {
+                            add_int_prop("gabor_type", data->type);
+                        }
+                    }
+                    else if (strcmp(node->idname, "ShaderNodeTexGradient") == 0)
+                    {
+                        NodeTexGradient* data = (NodeTexGradient*)node->storage;
+                        if (data)
+                        {
+                            add_int_prop("gradient_type", data->gradient_type);
+                        }
+                    }
+                    else if (strcmp(node->idname, "ShaderNodeTexMagic") == 0)
+                    {
+                        NodeTexMagic* data = (NodeTexMagic*)node->storage;
+                        if (data)
+                        {
+                            add_int_prop("turbulence_depth", data->depth);
+                        }
+                    }
+                    else if (strcmp(node->idname, "ShaderNodeTexVoronoi") == 0)
+                    {
+                        NodeTexVoronoi* data = (NodeTexVoronoi*)node->storage;
+                        if (data)
+                        {
+                            add_int_prop("voronoi_dimensions", data->dimensions);
+                            add_int_prop("feature", data->feature);
+                            add_int_prop("distance", data->distance);
+                        }
+                    }
+                    else if (strcmp(node->idname, "ShaderNodeTexWave") == 0)
+                    {
+                        NodeTexWave* data = (NodeTexWave*)node->storage;
+                        if (data)
+                        {
+                            add_int_prop("wave_type", data->wave_type);
+                            add_int_prop("bands_direction", data->bands_direction);
+                            add_int_prop("rings_direction", data->rings_direction);
+                            add_int_prop("wave_profile", data->wave_profile);
+                        }
+                    }
+                    else if (strcmp(node->idname, "ShaderNodeTexWhiteNoise") == 0)
+                    {
+                        add_int_prop("noise_dimensions", node->custom1);
+                    }
+                    else if (strcmp(node->idname, "ShaderNodeVectorDisplacement") == 0)
+                    {
+                        add_int_prop("space", node->custom1);
+                    }
+                    else if (strcmp(node->idname, "ShaderNodeVectorRotate") == 0)
+                    {
+                        add_int_prop("rotation_type", node->custom1);
+                        add_bool_prop("invert", node->custom2 != 0);
+                    }
+                    else if (strcmp(node->idname, "ShaderNodeVectorTransform") == 0)
+                    {
+                        NodeShaderVectTransform* data = (NodeShaderVectTransform*)node->storage;
+                        if (data)
+                        {
+                            add_int_prop("vector_type", data->type);
+                            add_int_prop("convert_from", data->convert_from);
+                            add_int_prop("convert_to", data->convert_to);
+                        }
+                    }
 
                     material_data.nodes.push_back(node_data);
                 }
@@ -649,6 +730,16 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                             from_socket    = it->second.socket_id;
                         }
                     }
+                    else if (strcmp(resolved_node->idname, "NodeGroupInput") == 0)
+                    {
+                        // Handle GroupInput -> Reroute -> GroupOutput (pass-through)
+                        auto it = input_mappings.find(resolved_sock->identifier);
+                        if (it != input_mappings.end())
+                        {
+                            from_node_name = it->second.node_name;
+                            from_socket    = it->second.socket_id;
+                        }
+                    }
 
                     output_mappings[link->tosock->identifier] = {from_node_name, from_socket};
                     continue;
@@ -660,6 +751,22 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                     auto& src_output_map = group_output_maps[resolved_node->name];
                     auto it              = src_output_map.find(resolved_sock->identifier);
                     if (it != src_output_map.end())
+                    {
+                        shader_link_t link_data;
+                        link_data.from_node   = it->second.node_name;
+                        link_data.from_socket = it->second.socket_id;
+                        link_data.to_node     = prefix + link->tonode->name;
+                        link_data.to_socket   = link->tosock->identifier;
+                        material_data.links.push_back(link_data);
+                    }
+                    continue;
+                }
+
+                // Handle case where reroute resolves back to GroupInput (GroupInput -> Reroute -> Node)
+                if (strcmp(resolved_node->idname, "NodeGroupInput") == 0)
+                {
+                    auto it = input_mappings.find(resolved_sock->identifier);
+                    if (it != input_mappings.end())
                     {
                         shader_link_t link_data;
                         link_data.from_node   = it->second.node_name;
@@ -1114,8 +1221,8 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
 
                 for (int tri_idx : triangle_indices)
                 {
-                    blender::int3 tri = corner_tris[tri_idx];
-                    triangle_t triangle;
+                    blender::int3 tri   = corner_tris[tri_idx];
+                    triangle_t triangle = {};
                     for (int i = 0; i < 3; i++)
                     {
                         int corner                      = tri[i];
@@ -2445,6 +2552,23 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                         abort();
                     }
                     fields.push_back(make_field(field_opt.value(), input.default_value.value()));
+                }
+
+                // For Value and RGB nodes, the constant value is stored in the output socket
+                // We treat it as an input field since it's a value that defines the node's output
+                if (n_type == BB_SHADER_NODE_TYPE_VALUE || n_type == BB_SHADER_NODE_TYPE_RGB)
+                {
+                    for (const auto& output : node->outputs)
+                    {
+                        if (!output.default_value.has_value()) continue;
+                        auto field_opt = get_input_field(n_type, output.identifier);
+                        if (!field_opt.has_value())
+                        {
+                            fprintf(stderr, "[zachary] FATAL: Unknown input field '%s' for node type %d\n", output.identifier.c_str(), (int)n_type);
+                            abort();
+                        }
+                        fields.push_back(make_field(field_opt.value(), output.default_value.value()));
+                    }
                 }
 
                 // Add props
