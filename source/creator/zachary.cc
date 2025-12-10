@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <map>
@@ -1626,7 +1627,10 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 {            "ShaderNodeInvert",              BB_SHADER_NODE_TYPE_INVERT},
                 {           "ShaderNodeFresnel",             BB_SHADER_NODE_TYPE_FRESNEL},
                 {    "ShaderNodeOutputMaterial",              BB_SHADER_NODE_TYPE_OUTPUT},
+                {    "ShaderNodeBsdfPrincipled",              BB_SHADER_NODE_TYPE_OUTPUT},
                 {          "ShaderNodeTexCoord",               BB_SHADER_NODE_TYPE_INPUT},
+                {       "ShaderNodeNewGeometry",               BB_SHADER_NODE_TYPE_INPUT},
+                {        "ShaderNodeObjectInfo",               BB_SHADER_NODE_TYPE_INPUT},
             };
             auto it = node_type_map.find(idname);
             if (it != node_type_map.end()) return it->second;
@@ -1852,13 +1856,17 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
         // Map socket identifier to output field type
         auto get_output_field = [](bb_shader_node_type_e node_type, const std::string& socket_id) -> std::optional<bb_shader_output_field_type_e>
         {
-            // Input node outputs
+            // Input
             if (node_type == BB_SHADER_NODE_TYPE_INPUT)
             {
-                if (socket_id == "Object") return BB_SHADER_OUTPUT_FIELD_INPUT_POSITION;
+                if (socket_id == "Object") return BB_SHADER_OUTPUT_FIELD_INPUT_OBJECT;
                 if (socket_id == "Generated") return BB_SHADER_OUTPUT_FIELD_INPUT_GENERATED;
-                if (socket_id == "Normal") return BB_SHADER_OUTPUT_FIELD_INPUT_NORMAL;
                 if (socket_id == "UV") return BB_SHADER_OUTPUT_FIELD_INPUT_UV0;
+                if (socket_id == "Position") return BB_SHADER_OUTPUT_FIELD_INPUT_POSITION;
+                if (socket_id == "Normal") return BB_SHADER_OUTPUT_FIELD_INPUT_NORMAL;
+                if (socket_id == "Tangent") return BB_SHADER_OUTPUT_FIELD_INPUT_TANGENT;
+                if (socket_id == "True Normal") return BB_SHADER_OUTPUT_FIELD_INPUT_GEO_NORMAL;
+                if (socket_id == "Location") return BB_SHADER_OUTPUT_FIELD_INPUT_LOCATION;
             }
             // UV Map
             if (node_type == BB_SHADER_NODE_TYPE_UV_MAP)
@@ -2190,14 +2198,20 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
             for (const auto& node : mat.nodes)
             {
                 auto node_type_opt = get_node_type(node.idname);
-                if (node_type_opt.has_value())
+                if (!node_type_opt.has_value())
                 {
-                    node_name_to_idx[node.name] = valid_nodes.size();
-                    valid_nodes.push_back({&node, node_type_opt.value()});
+                    fprintf(stderr, "[zachary] FATAL: Unknown node type '%s' in material '%s'\n", node.idname.c_str(), mat.name.c_str());
+                    abort();
                 }
+                node_name_to_idx[node.name] = valid_nodes.size();
+                valid_nodes.push_back({&node, node_type_opt.value()});
             }
 
-            if (valid_nodes.empty()) continue;
+            if (valid_nodes.empty())
+            {
+                fprintf(stderr, "[zachary] FATAL: No valid nodes in material '%s'\n", mat.name.c_str());
+                abort();
+            }
 
             // Build nodes
             BBArchiveShaderNode* bb_nodes = (BBArchiveShaderNode*)arena_alloc_z(arena, sizeof(BBArchiveShaderNode) * valid_nodes.size())->data;
@@ -2215,7 +2229,11 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 {
                     if (!input.default_value.has_value()) continue;
                     auto field_opt = get_input_field(n_type, input.identifier);
-                    if (!field_opt.has_value()) continue;
+                    if (!field_opt.has_value())
+                    {
+                        fprintf(stderr, "[zachary] FATAL: Unknown input field '%s' for node type %d\n", input.identifier.c_str(), (int)n_type);
+                        abort();
+                    }
                     fields.push_back(make_field(field_opt.value(), input.default_value.value()));
                 }
 
@@ -2223,7 +2241,11 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 for (const auto& prop : node->props)
                 {
                     auto field_opt = get_prop_field(n_type, prop.identifier);
-                    if (!field_opt.has_value()) continue;
+                    if (!field_opt.has_value())
+                    {
+                        fprintf(stderr, "[zachary] FATAL: Unknown prop field '%s' for node type %d\n", prop.identifier.c_str(), (int)n_type);
+                        abort();
+                    }
                     fields.push_back(make_field(field_opt.value(), prop.value));
                 }
 
@@ -2246,7 +2268,16 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
             {
                 auto src_it = node_name_to_idx.find(link.from_node);
                 auto dst_it = node_name_to_idx.find(link.to_node);
-                if (src_it == node_name_to_idx.end() || dst_it == node_name_to_idx.end()) continue;
+                if (src_it == node_name_to_idx.end())
+                {
+                    fprintf(stderr, "[zachary] FATAL: Link source node '%s' not found in material '%s'\n", link.from_node.c_str(), mat.name.c_str());
+                    abort();
+                }
+                if (dst_it == node_name_to_idx.end())
+                {
+                    fprintf(stderr, "[zachary] FATAL: Link destination node '%s' not found in material '%s'\n", link.to_node.c_str(), mat.name.c_str());
+                    abort();
+                }
 
                 uint32_t src_idx               = src_it->second;
                 uint32_t dst_idx               = dst_it->second;
@@ -2255,7 +2286,16 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
 
                 auto from_field_opt            = get_output_field(src_type, link.from_socket);
                 auto to_field_opt              = get_input_field(dst_type, link.to_socket);
-                if (!from_field_opt.has_value() || !to_field_opt.has_value()) continue;
+                if (!from_field_opt.has_value())
+                {
+                    fprintf(stderr, "[zachary] FATAL: Unknown output field '%s' for node type %d in material '%s'\n", link.from_socket.c_str(), (int)src_type, mat.name.c_str());
+                    abort();
+                }
+                if (!to_field_opt.has_value())
+                {
+                    fprintf(stderr, "[zachary] FATAL: Unknown input field '%s' for node type %d in material '%s'\n", link.to_socket.c_str(), (int)dst_type, mat.name.c_str());
+                    abort();
+                }
 
                 BBArchiveShaderLink bb_link;
                 bb_link.src_idx    = src_idx;
