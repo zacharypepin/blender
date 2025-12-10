@@ -4,12 +4,14 @@
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <optional>
 #include <unordered_map>
 #include <vector>
 
 #include "BLI_listbase.h"
 #include "BLI_math_vector_types.hh"
 
+#include "DNA_armature_types.h"
 #include "DNA_image_types.h"
 #include "DNA_material_types.h"
 #include "DNA_mesh_types.h"
@@ -82,16 +84,19 @@ namespace
 
     struct scene_elem_t
     {
+        std::string name;
+        std::optional<std::string> parent_name;
         vec3_t pos;
         vec3_t euler_rot;
         vec3_t scale;
-        std::string mesh_name;
+        std::optional<std::string> mesh_name;
+        std::optional<std::string> skel_name;
     };
 
     struct scene_t
     {
         std::string name;
-        std::vector<scene_elem_t> elems;
+        std::map<std::string, scene_elem_t> elems;
     };
 
     struct image_t
@@ -405,26 +410,56 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
 
             FOREACH_SCENE_OBJECT_BEGIN(scene, ob)
             {
-                if (ob->type != OB_MESH || ob->data == nullptr) continue;
+                if (ob->data == nullptr) continue;
 
-                Mesh* mesh            = (Mesh*)ob->data;
-                std::string mesh_name = mesh->id.name;
+                std::optional<std::string> parent_name = ob->parent != nullptr ? (std::optional<std::string>)std::string(ob->parent->id.name) : std::nullopt;
 
-                if (data.meshes.find(mesh_name) == data.meshes.end()) continue;
+                if (ob->type == OB_MESH)
+                {
+                    Mesh* mesh            = (Mesh*)ob->data;
+                    std::string mesh_name = mesh->id.name;
+                    if (data.meshes.find(mesh_name) == data.meshes.end())
+                    {
+                        continue;
+                    }
 
-                scene_elem_t elem = {};
-                elem.pos.x        = ob->loc[0];
-                elem.pos.y        = ob->loc[1];
-                elem.pos.z        = ob->loc[2];
-                elem.euler_rot.x  = ob->rot[0];
-                elem.euler_rot.y  = ob->rot[1];
-                elem.euler_rot.z  = ob->rot[2];
-                elem.scale.x      = ob->scale[0];
-                elem.scale.y      = ob->scale[1];
-                elem.scale.z      = ob->scale[2];
-                elem.mesh_name    = mesh_name;
+                    scene_elem_t elem           = {};
+                    elem.name                   = ob->id.name;
+                    elem.parent_name            = parent_name;
+                    elem.pos.x                  = ob->loc[0];
+                    elem.pos.y                  = ob->loc[1];
+                    elem.pos.z                  = ob->loc[2];
+                    elem.euler_rot.x            = ob->rot[0];
+                    elem.euler_rot.y            = ob->rot[1];
+                    elem.euler_rot.z            = ob->rot[2];
+                    elem.scale.x                = ob->scale[0];
+                    elem.scale.y                = ob->scale[1];
+                    elem.scale.z                = ob->scale[2];
+                    elem.mesh_name              = mesh_name;
 
-                scene_data.elems.push_back(elem);
+                    scene_data.elems[elem.name] = std::move(elem);
+                }
+                else if (ob->type == OB_ARMATURE)
+                {
+                    bArmature* arm              = (bArmature*)ob->data;
+                    std::string skel_name       = arm->id.name;
+
+                    scene_elem_t elem           = {};
+                    elem.name                   = ob->id.name;
+                    elem.parent_name            = parent_name;
+                    elem.pos.x                  = ob->loc[0];
+                    elem.pos.y                  = ob->loc[1];
+                    elem.pos.z                  = ob->loc[2];
+                    elem.euler_rot.x            = ob->rot[0];
+                    elem.euler_rot.y            = ob->rot[1];
+                    elem.euler_rot.z            = ob->rot[2];
+                    elem.scale.x                = ob->scale[0];
+                    elem.scale.y                = ob->scale[1];
+                    elem.scale.z                = ob->scale[2];
+                    elem.skel_name              = skel_name;
+
+                    scene_data.elems[elem.name] = std::move(elem);
+                }
             }
             FOREACH_SCENE_OBJECT_END;
 
@@ -500,11 +535,86 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
     // ===============================================================================================
     // ===============================================================================================
     {
-        fprintf(log_file, "[zachary] === DATA DUMP ===\n");
+        fprintf(log_file, "[zachary] === DATA DUMP ===\n\n");
 
-        // todo
+        // Scenes
+        fprintf(log_file, "SCENES (%zu):\n", data.scenes.size());
+        for (const auto& scene : data.scenes)
+        {
+            fprintf(log_file, "  scene: %s\n", scene.name.c_str());
+            for (const auto& [elem_name, elem] : scene.elems)
+            {
+                fprintf(log_file, "    elem: %s\n", elem.name.c_str());
+                if (elem.parent_name.has_value())
+                {
+                    fprintf(log_file, "      parent: %s\n", elem.parent_name.value().c_str());
+                }
+                fprintf(log_file, "      pos: (%.3f, %.3f, %.3f)\n", elem.pos.x, elem.pos.y, elem.pos.z);
+                fprintf(log_file, "      rot: (%.3f, %.3f, %.3f)\n", elem.euler_rot.x, elem.euler_rot.y, elem.euler_rot.z);
+                fprintf(log_file, "      scale: (%.3f, %.3f, %.3f)\n", elem.scale.x, elem.scale.y, elem.scale.z);
+                if (elem.mesh_name.has_value())
+                {
+                    fprintf(log_file, "      mesh: %s\n", elem.mesh_name.value().c_str());
+                }
+                if (elem.skel_name.has_value())
+                {
+                    fprintf(log_file, "      skel: %s\n", elem.skel_name.value().c_str());
+                }
+            }
+        }
+        fprintf(log_file, "\n");
 
-        fprintf(log_file, "[zachary] === END DATA DUMP ===\n");
+        // Meshes
+        fprintf(log_file, "MESHES (%zu):\n", data.meshes.size());
+        for (const auto& [mesh_name, mesh] : data.meshes)
+        {
+            size_t total_tris = 0;
+            for (const auto& submesh : mesh.submeshes)
+            {
+                total_tris += submesh.triangles.size();
+            }
+            fprintf(log_file, "  mesh: %s (%zu submeshes, %zu triangles)\n", mesh.name.c_str(), mesh.submeshes.size(), total_tris);
+            for (size_t i = 0; i < mesh.submeshes.size(); i++)
+            {
+                const auto& submesh = mesh.submeshes[i];
+                fprintf(log_file, "    submesh[%zu]: material=%s, tris=%zu\n", i, submesh.material_name.c_str(), submesh.triangles.size());
+            }
+        }
+        fprintf(log_file, "\n");
+
+        // Images
+        fprintf(log_file, "IMAGES (%zu):\n", data.images.size());
+        for (const auto& [image_name, image] : data.images)
+        {
+            fprintf(log_file, "  image: %s (%ux%u, srgb=%s, %zu bytes)\n", image.name.c_str(), image.width, image.height, image.is_srgb ? "true" : "false", image.rgba_data.size());
+        }
+        fprintf(log_file, "\n");
+
+        // Materials
+        fprintf(log_file, "MATERIALS (%zu):\n", data.materials.size());
+        for (const auto& [mat_name, mat] : data.materials)
+        {
+            fprintf(log_file, "  material: %s (%zu nodes, %zu links)\n", mat.name.c_str(), mat.nodes.size(), mat.links.size());
+            for (size_t i = 0; i < mat.nodes.size(); i++)
+            {
+                const auto& node = mat.nodes[i];
+                fprintf(log_file, "    node[%zu]: %s (inputs=%zu, outputs=%zu)\n", i, node.idname.c_str(), node.inputs.size(), node.outputs.size());
+                for (const auto& input : node.inputs)
+                {
+                    fprintf(log_file, "      in: %s (%s)\n", input.identifier.c_str(), input.idname.c_str());
+                }
+                for (const auto& output : node.outputs)
+                {
+                    fprintf(log_file, "      out: %s (%s)\n", output.identifier.c_str(), output.idname.c_str());
+                }
+            }
+            for (const auto& link : mat.links)
+            {
+                fprintf(log_file, "    link: %s.%s -> %s.%s\n", link.from_node.c_str(), link.from_socket.c_str(), link.to_node.c_str(), link.to_socket.c_str());
+            }
+        }
+
+        fprintf(log_file, "\n[zachary] === END DATA DUMP ===\n");
     }
 
     // ===============================================================================================
@@ -600,24 +710,32 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
 
         for (size_t scene_idx = 0; scene_idx < data.scenes.size(); scene_idx++)
         {
-            const scene_t& scene      = data.scenes[scene_idx];
+            const scene_t& scene   = data.scenes[scene_idx];
 
-            BBArchiveSceneElem* elems = (BBArchiveSceneElem*)arena_alloc_z(arena, sizeof(BBArchiveSceneElem) * scene.elems.size())->data;
-
-            for (size_t elem_idx = 0; elem_idx < scene.elems.size(); elem_idx++)
+            size_t mesh_elem_count = 0;
+            for (const auto& [elem_name, src_elem] : scene.elems)
             {
-                const scene_elem_t& src_elem = scene.elems[elem_idx];
-                const mesh_t& mesh           = data.meshes.at(src_elem.mesh_name);
+                if (src_elem.mesh_name.has_value()) mesh_elem_count++;
+            }
 
-                int mat_count                = mesh.submeshes.size();
-                const char** mat_names       = (const char**)arena_alloc_z(arena, sizeof(const char*) * mat_count)->data;
+            BBArchiveSceneElem* elems = (BBArchiveSceneElem*)arena_alloc_z(arena, sizeof(BBArchiveSceneElem) * mesh_elem_count)->data;
+
+            size_t elem_idx           = 0;
+            for (const auto& [elem_name, src_elem] : scene.elems)
+            {
+                if (!src_elem.mesh_name.has_value()) continue;
+
+                const mesh_t& mesh     = data.meshes.at(src_elem.mesh_name.value());
+
+                int mat_count          = mesh.submeshes.size();
+                const char** mat_names = (const char**)arena_alloc_z(arena, sizeof(const char*) * mat_count)->data;
                 for (size_t i = 0; i < mesh.submeshes.size(); i++)
                 {
                     mat_names[i] = mesh.submeshes[i].material_name.c_str();
                 }
 
                 BBArchiveSceneElem& elem = elems[elem_idx];
-                elem.mesh_name           = src_elem.mesh_name.c_str();
+                elem.mesh_name           = src_elem.mesh_name.value().c_str();
                 elem.pos[0]              = src_elem.pos.x;
                 elem.pos[1]              = src_elem.pos.y;
                 elem.pos[2]              = src_elem.pos.z;
@@ -629,10 +747,12 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 elem.sca[2]              = src_elem.scale.z;
                 elem.mat_count           = mat_count;
                 elem.mat_names           = mat_names;
+
+                elem_idx++;
             }
 
             bb_scenes[scene_idx].scene_name = scene.name.c_str();
-            bb_scenes[scene_idx].elem_count = scene.elems.size();
+            bb_scenes[scene_idx].elem_count = mesh_elem_count;
             bb_scenes[scene_idx].elems      = elems;
         }
     }
