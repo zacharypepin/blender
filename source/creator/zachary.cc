@@ -229,6 +229,51 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
         {
             if (tree == nullptr) return;
 
+            // Build reroute resolution map: traces through reroute chains to find actual source
+            // Maps reroute node name -> (source node, source socket)
+            std::map<std::string, std::pair<bNode*, bNodeSocket*>> reroute_sources;
+            {
+                // First, find what each reroute's input is directly connected to
+                std::map<std::string, std::pair<bNode*, bNodeSocket*>> direct_sources;
+                LISTBASE_FOREACH(bNodeLink*, link, &tree->links)
+                {
+                    if (!link->fromnode || !link->tonode || !link->fromsock || !link->tosock) continue;
+                    if (strcmp(link->tonode->idname, "NodeReroute") == 0)
+                    {
+                        direct_sources[link->tonode->name] = {link->fromnode, link->fromsock};
+                    }
+                }
+
+                // Resolve chains: trace through reroutes to find the actual source
+                for (auto& [reroute_name, source] : direct_sources)
+                {
+                    bNode* current_node       = source.first;
+                    bNodeSocket* current_sock = source.second;
+                    while (current_node && strcmp(current_node->idname, "NodeReroute") == 0)
+                    {
+                        auto it = direct_sources.find(current_node->name);
+                        if (it == direct_sources.end()) break;
+                        current_node = it->second.first;
+                        current_sock = it->second.second;
+                    }
+                    reroute_sources[reroute_name] = {current_node, current_sock};
+                }
+            }
+
+            // Helper to resolve actual source (handles reroutes)
+            auto resolve_source = [&](bNode* from_node, bNodeSocket* from_sock) -> std::pair<bNode*, bNodeSocket*>
+            {
+                if (strcmp(from_node->idname, "NodeReroute") == 0)
+                {
+                    auto it = reroute_sources.find(from_node->name);
+                    if (it != reroute_sources.end())
+                    {
+                        return it->second;
+                    }
+                }
+                return {from_node, from_sock};
+            };
+
             // First pass: identify group nodes, build their io mappings, collect internal links for resolving group io
             std::map<std::string, bNodeTree*> group_trees;
             std::map<std::string, std::map<std::string, socket_endpoint_t>> group_input_maps;
@@ -254,7 +299,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
             // Second pass: process all nodes
             LISTBASE_FOREACH(bNode*, node, &tree->nodes)
             {
-                if (strcmp(node->idname, "NodeGroupInput") == 0 || strcmp(node->idname, "NodeGroupOutput") == 0)
+                if (strcmp(node->idname, "NodeGroupInput") == 0 || strcmp(node->idname, "NodeGroupOutput") == 0 || strcmp(node->idname, "NodeReroute") == 0)
                 {
                     continue;
                 }
@@ -268,19 +313,23 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                             continue;
                         }
 
-                        if (strcmp(link->fromnode->idname, "ShaderNodeGroup") == 0)
+                        // Resolve through reroutes
+                        auto [resolved_node, resolved_sock] = resolve_source(link->fromnode, link->fromsock);
+                        if (!resolved_node) continue;
+
+                        if (strcmp(resolved_node->idname, "ShaderNodeGroup") == 0)
                         {
-                            auto& src_output_map = group_output_maps[link->fromnode->name];
-                            auto it              = src_output_map.find(link->fromsock->identifier);
+                            auto& src_output_map = group_output_maps[resolved_node->name];
+                            auto it              = src_output_map.find(resolved_sock->identifier);
                             if (it != src_output_map.end())
                             {
                                 nested_input_mappings[link->tosock->identifier] = it->second;
                                 continue;
                             }
                         }
-                        else if (strcmp(link->fromnode->idname, "NodeGroupInput") == 0)
+                        else if (strcmp(resolved_node->idname, "NodeGroupInput") == 0)
                         {
-                            auto it = input_mappings.find(link->fromsock->identifier);
+                            auto it = input_mappings.find(resolved_sock->identifier);
                             if (it != input_mappings.end())
                             {
                                 nested_input_mappings[link->tosock->identifier] = it->second;
@@ -288,8 +337,8 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                             }
                         }
 
-                        std::string from_node_name                      = prefix + link->fromnode->name;
-                        nested_input_mappings[link->tosock->identifier] = {from_node_name, link->fromsock->identifier};
+                        std::string from_node_name                      = prefix + resolved_node->name;
+                        nested_input_mappings[link->tosock->identifier] = {from_node_name, resolved_sock->identifier};
                     }
 
                     // Recursively flatten the group
@@ -335,15 +384,21 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 if (!link->fromnode || !link->tonode || !link->fromsock || !link->tosock) continue;
 
                 if (strcmp(link->fromnode->idname, "NodeGroupInput") == 0) continue;
+
+                if (strcmp(link->tonode->idname, "NodeReroute") == 0) continue;
+
+                auto [resolved_node, resolved_sock] = resolve_source(link->fromnode, link->fromsock);
+                if (!resolved_node) continue;
+
                 if (strcmp(link->tonode->idname, "NodeGroupOutput") == 0)
                 {
-                    std::string from_node_name = prefix + link->fromnode->name;
-                    std::string from_socket    = link->fromsock->identifier;
+                    std::string from_node_name = prefix + resolved_node->name;
+                    std::string from_socket    = resolved_sock->identifier;
 
-                    if (strcmp(link->fromnode->idname, "ShaderNodeGroup") == 0)
+                    if (strcmp(resolved_node->idname, "ShaderNodeGroup") == 0)
                     {
-                        auto& src_output_map = group_output_maps[link->fromnode->name];
-                        auto it              = src_output_map.find(link->fromsock->identifier);
+                        auto& src_output_map = group_output_maps[resolved_node->name];
+                        auto it              = src_output_map.find(resolved_sock->identifier);
                         if (it != src_output_map.end())
                         {
                             from_node_name = it->second.node_name;
@@ -356,10 +411,10 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 }
 
                 if (strcmp(link->tonode->idname, "ShaderNodeGroup") == 0) continue;
-                if (strcmp(link->fromnode->idname, "ShaderNodeGroup") == 0)
+                if (strcmp(resolved_node->idname, "ShaderNodeGroup") == 0)
                 {
-                    auto& src_output_map = group_output_maps[link->fromnode->name];
-                    auto it              = src_output_map.find(link->fromsock->identifier);
+                    auto& src_output_map = group_output_maps[resolved_node->name];
+                    auto it              = src_output_map.find(resolved_sock->identifier);
                     if (it != src_output_map.end())
                     {
                         shader_link_t link_data;
@@ -373,8 +428,8 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 }
 
                 shader_link_t link_data;
-                link_data.from_node   = prefix + link->fromnode->name;
-                link_data.from_socket = link->fromsock->identifier;
+                link_data.from_node   = prefix + resolved_node->name;
+                link_data.from_socket = resolved_sock->identifier;
                 link_data.to_node     = prefix + link->tonode->name;
                 link_data.to_socket   = link->tosock->identifier;
                 material_data.links.push_back(link_data);
@@ -384,6 +439,8 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
             LISTBASE_FOREACH(bNodeLink*, link, &tree->links)
             {
                 if (!link->fromnode || !link->tonode || !link->fromsock || !link->tosock) continue;
+
+                if (strcmp(link->tonode->idname, "NodeReroute") == 0) continue;
 
                 if (strcmp(link->fromnode->idname, "NodeGroupInput") == 0 && strcmp(link->tonode->idname, "NodeGroupOutput") != 0 && strcmp(link->tonode->idname, "ShaderNodeGroup") != 0)
                 {
@@ -435,6 +492,9 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 }
             }
 
+            // Supported Principled BSDF input sockets
+            static const std::set<std::string> supported_sockets = {"Base Color", "Emission Color", "Emission Strength", "Roughness", "Metallic", "Specular IOR Level", "Normal", "Alpha"};
+
             // Build reverse adjacency: for each node, which nodes feed into it
             std::map<std::string, std::vector<std::string>> reverse_adj;
             {
@@ -444,12 +504,24 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 }
             }
 
-            // BFS backwards from Principled BSDF to find all contributing nodes
+            // BFS backwards from supported Principled BSDF sockets only
             std::set<std::string> reachable_nodes;
             {
-                std::vector<std::string> queue;
-                queue.push_back(principled_node_name.value());
                 reachable_nodes.insert(principled_node_name.value());
+
+                std::vector<std::string> queue;
+                for (const auto& link : material_data.links)
+                {
+                    if (link.to_node == principled_node_name.value() && supported_sockets.count(link.to_socket))
+                    {
+                        if (reachable_nodes.find(link.from_node) == reachable_nodes.end())
+                        {
+                            reachable_nodes.insert(link.from_node);
+                            queue.push_back(link.from_node);
+                        }
+                    }
+                }
+
                 while (!queue.empty())
                 {
                     std::string current = queue.back();
@@ -477,20 +549,115 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 }
             }
 
-            // Filter links to only those between reachable nodes
+            // Filter links to only those between reachable nodes, and only supported sockets for Principled BSDF
             std::vector<shader_link_t> filtered_links;
             {
                 for (auto& link : material_data.links)
                 {
-                    if (reachable_nodes.count(link.from_node) && reachable_nodes.count(link.to_node))
+                    if (!reachable_nodes.count(link.from_node) || !reachable_nodes.count(link.to_node))
                     {
-                        filtered_links.push_back(std::move(link));
+                        continue;
+                    }
+                    // For links going to Principled BSDF, only keep supported sockets
+                    if (link.to_node == principled_node_name.value() && !supported_sockets.count(link.to_socket))
+                    {
+                        continue;
+                    }
+                    filtered_links.push_back(std::move(link));
+                }
+            }
+
+            material_data.nodes                                                              = std::move(filtered_nodes);
+            material_data.links                                                              = std::move(filtered_links);
+
+            static const std::map<std::string, std::set<std::string>> supported_node_outputs = {
+                {       "ShaderNodeNewGeometry",                     {"Position", "Normal", "Tangent", "True Normal"}},
+                {          "ShaderNodeTexCoord",                              {"Generated", "UV", "Object", "Normal"}},
+                {        "ShaderNodeObjectInfo",                                                         {"Location"}},
+                {             "ShaderNodeUVMap",                                                               {"UV"}},
+                {    "ShaderNodeBsdfPrincipled",                                                             {"BSDF"}},
+                {              "ShaderNodeMath",                                                            {"Value"}},
+                {        "ShaderNodeVectorMath",                                                  {"Vector", "Value"}},
+                {               "ShaderNodeMix", {"Result_Float", "Result_Vector", "Result_Color", "Result_Rotation"}},
+                {     "ShaderNodeSeparateColor",                                             {"Red", "Green", "Blue"}},
+                {      "ShaderNodeCombineColor",                                                            {"Color"}},
+                {          "ShaderNodeTexNoise",                                                     {"Fac", "Color"}},
+                {          "ShaderNodeTexImage",                                                   {"Color", "Alpha"}},
+                {          "ShaderNodeValToRGB",                                                   {"Color", "Alpha"}},
+                {  "ShaderNodeAmbientOcclusion",                                                      {"Color", "AO"}},
+                {              "ShaderNodeBump",                                                           {"Normal"}},
+                {             "ShaderNodeClamp",                                                           {"Result"}},
+                {      "ShaderNodeDisplacement",                                                     {"Displacement"}},
+                {          "ShaderNodeMapRange",                                                 {"Result", "Vector"}},
+                {           "ShaderNodeMapping",                                                           {"Vector"}},
+                {         "ShaderNodeNormalMap",                                                           {"Normal"}},
+                {           "ShaderNodeTangent",                                                          {"Tangent"}},
+                {          "ShaderNodeTexBrick",                                                     {"Color", "Fac"}},
+                {    "ShaderNodeTexEnvironment",                                                            {"Color"}},
+                {          "ShaderNodeTexGabor",                                      {"Value", "Phase", "Intensity"}},
+                {       "ShaderNodeTexGradient",                                                     {"Color", "Fac"}},
+                {          "ShaderNodeTexMagic",                                                     {"Color", "Fac"}},
+                {        "ShaderNodeTexVoronoi",                     {"Distance", "Color", "Position", "W", "Radius"}},
+                {           "ShaderNodeTexWave",                                                     {"Color", "Fac"}},
+                {     "ShaderNodeTexWhiteNoise",                                                   {"Value", "Color"}},
+                {"ShaderNodeVectorDisplacement",                                                     {"Displacement"}},
+                {      "ShaderNodeVectorRotate",                                                           {"Vector"}},
+                {   "ShaderNodeVectorTransform",                                                           {"Vector"}},
+                {             "ShaderNodeValue",                                                            {"Value"}},
+                {             "ShaderNodeGamma",                                                            {"Color"}},
+                {    "ShaderNodeOutputMaterial",                                                                   {}},
+                {        "ShaderNodeCombineXYZ",                                                           {"Vector"}},
+                {       "ShaderNodeSeparateXYZ",                                                      {"X", "Y", "Z"}},
+                {               "ShaderNodeRGB",                                                            {"Color"}},
+                {    "ShaderNodeBrightContrast",                                                            {"Color"}},
+                {           "ShaderNodeRGBToBW",                                                              {"Val"}},
+                {     "ShaderNodeHueSaturation",                                                            {"Color"}},
+                {            "ShaderNodeInvert",                                                            {"Color"}},
+                {           "ShaderNodeFresnel",                                                              {"Fac"}},
+            };
+
+            bool is_supported = true;
+            {
+                for (const auto& node : material_data.nodes)
+                {
+                    if (supported_node_outputs.find(node.idname) == supported_node_outputs.end())
+                    {
+                        fprintf(log_file, "[zachary] Skipping material %s (unsupported node type: %s)\n", mat->id.name, node.idname.c_str());
+                        is_supported = false;
+                        break;
+                    }
+                }
+
+                if (is_supported)
+                {
+                    std::map<std::string, std::string> node_name_to_idname;
+                    for (const auto& node : material_data.nodes)
+                    {
+                        node_name_to_idname[node.name] = node.idname;
+                    }
+
+                    for (const auto& link : material_data.links)
+                    {
+                        auto node_it = node_name_to_idname.find(link.from_node);
+                        if (node_it == node_name_to_idname.end()) continue;
+
+                        const std::string& idname     = node_it->second;
+                        const auto& supported_outputs = supported_node_outputs.at(idname);
+
+                        if (!supported_outputs.count(link.from_socket))
+                        {
+                            fprintf(log_file, "[zachary] Skipping material %s (unsupported output socket: %s.%s)\n", mat->id.name, idname.c_str(), link.from_socket.c_str());
+                            is_supported = false;
+                            break;
+                        }
                     }
                 }
             }
 
-            material_data.nodes                = std::move(filtered_nodes);
-            material_data.links                = std::move(filtered_links);
+            if (!is_supported)
+            {
+                continue;
+            }
 
             data.materials[material_data.name] = std::move(material_data);
         }
