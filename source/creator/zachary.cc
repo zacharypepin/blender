@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <optional>
 #include <unordered_map>
@@ -116,6 +117,7 @@ namespace
 
     struct shader_node_t
     {
+        std::string name;
         std::string idname; // e.g. "ShaderNodeTexImage", "ShaderNodeBsdfPrincipled"
         std::vector<shader_node_socket_t> inputs;
         std::vector<shader_node_socket_t> outputs;
@@ -210,9 +212,195 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
     // ===============================================================================================
     // ===============================================================================================
     // materials
+    // - ShaderNodeGroup nodes are recursively flattened out
+    // - node names are unique, uses dot separation for nested groups
     // ===============================================================================================
     // ===============================================================================================
     {
+        struct socket_endpoint_t
+        {
+            std::string node_name;
+            std::string socket_id;
+        };
+
+        std::function<void(bNodeTree * tree, const std::string& prefix, material_t& material_data, const std::map<std::string, socket_endpoint_t>& input_mappings, std::map<std::string, socket_endpoint_t>& output_mappings)> flatten_node_tree;
+        flatten_node_tree = [&flatten_node_tree](bNodeTree* tree, const std::string& prefix, material_t& material_data, const std::map<std::string, socket_endpoint_t>& input_mappings, std::map<std::string, socket_endpoint_t>& output_mappings)
+        {
+            if (tree == nullptr) return;
+
+            // First pass: identify group nodes, build their io mappings, collect internal links for resolving group io
+            std::map<std::string, bNodeTree*> group_trees;
+            std::map<std::string, std::map<std::string, socket_endpoint_t>> group_input_maps;
+            std::map<std::string, std::map<std::string, socket_endpoint_t>> group_output_maps;
+            LISTBASE_FOREACH(bNode*, node, &tree->nodes)
+            {
+                if (strcmp(node->idname, "ShaderNodeGroup") != 0 || node->id == nullptr)
+                {
+                    continue;
+                }
+
+                bNodeTree* group_tree   = (bNodeTree*)node->id;
+                group_trees[node->name] = group_tree;
+
+                LISTBASE_FOREACH(bNodeLink*, link, &group_tree->links)
+                {
+                    if (!link->fromnode || !link->tonode || !link->fromsock || !link->tosock) continue;
+                    if (strcmp(link->fromnode->idname, "NodeGroupInput") == 0) group_input_maps[node->name][link->fromsock->identifier] = {prefix + node->name + "." + link->tonode->name, link->tosock->identifier};
+                    if (strcmp(link->tonode->idname, "NodeGroupOutput") == 0) group_output_maps[node->name][link->tosock->identifier] = {prefix + node->name + "." + link->fromnode->name, link->fromsock->identifier};
+                }
+            }
+
+            // Second pass: process all nodes
+            LISTBASE_FOREACH(bNode*, node, &tree->nodes)
+            {
+                if (strcmp(node->idname, "NodeGroupInput") == 0 || strcmp(node->idname, "NodeGroupOutput") == 0)
+                {
+                    continue;
+                }
+                else if (strcmp(node->idname, "ShaderNodeGroup") == 0 && node->id != nullptr)
+                {
+                    std::map<std::string, socket_endpoint_t> nested_input_mappings;
+                    LISTBASE_FOREACH(bNodeLink*, link, &tree->links)
+                    {
+                        if (link->tonode != node || !link->fromnode || !link->fromsock || !link->tosock)
+                        {
+                            continue;
+                        }
+
+                        if (strcmp(link->fromnode->idname, "ShaderNodeGroup") == 0)
+                        {
+                            auto& src_output_map = group_output_maps[link->fromnode->name];
+                            auto it              = src_output_map.find(link->fromsock->identifier);
+                            if (it != src_output_map.end())
+                            {
+                                nested_input_mappings[link->tosock->identifier] = it->second;
+                                continue;
+                            }
+                        }
+                        else if (strcmp(link->fromnode->idname, "NodeGroupInput") == 0)
+                        {
+                            auto it = input_mappings.find(link->fromsock->identifier);
+                            if (it != input_mappings.end())
+                            {
+                                nested_input_mappings[link->tosock->identifier] = it->second;
+                                continue;
+                            }
+                        }
+
+                        std::string from_node_name                      = prefix + link->fromnode->name;
+                        nested_input_mappings[link->tosock->identifier] = {from_node_name, link->fromsock->identifier};
+                    }
+
+                    // Recursively flatten the group
+                    bNodeTree* group_tree    = (bNodeTree*)node->id;
+                    std::string group_prefix = prefix + node->name + ".";
+                    std::map<std::string, socket_endpoint_t> nested_output_mappings;
+                    flatten_node_tree(group_tree, group_prefix, material_data, nested_input_mappings, nested_output_mappings);
+
+                    // Store output mappings for link resolution
+                    group_output_maps[node->name] = nested_output_mappings;
+                }
+                else
+                {
+                    shader_node_t node_data;
+                    node_data.name   = prefix + node->name;
+                    node_data.idname = node->idname;
+
+                    // Input sockets
+                    LISTBASE_FOREACH(bNodeSocket*, socket, &node->inputs)
+                    {
+                        shader_node_socket_t socket_data;
+                        socket_data.identifier = socket->identifier;
+                        socket_data.idname     = socket->idname;
+                        node_data.inputs.push_back(socket_data);
+                    }
+
+                    // Output sockets
+                    LISTBASE_FOREACH(bNodeSocket*, socket, &node->outputs)
+                    {
+                        shader_node_socket_t socket_data;
+                        socket_data.identifier = socket->identifier;
+                        socket_data.idname     = socket->idname;
+                        node_data.outputs.push_back(socket_data);
+                    }
+
+                    material_data.nodes.push_back(node_data);
+                }
+            }
+
+            // Third pass: process links and resolve group boundaries
+            LISTBASE_FOREACH(bNodeLink*, link, &tree->links)
+            {
+                if (!link->fromnode || !link->tonode || !link->fromsock || !link->tosock) continue;
+
+                if (strcmp(link->fromnode->idname, "NodeGroupInput") == 0) continue;
+                if (strcmp(link->tonode->idname, "NodeGroupOutput") == 0)
+                {
+                    std::string from_node_name = prefix + link->fromnode->name;
+                    std::string from_socket    = link->fromsock->identifier;
+
+                    if (strcmp(link->fromnode->idname, "ShaderNodeGroup") == 0)
+                    {
+                        auto& src_output_map = group_output_maps[link->fromnode->name];
+                        auto it              = src_output_map.find(link->fromsock->identifier);
+                        if (it != src_output_map.end())
+                        {
+                            from_node_name = it->second.node_name;
+                            from_socket    = it->second.socket_id;
+                        }
+                    }
+
+                    output_mappings[link->tosock->identifier] = {from_node_name, from_socket};
+                    continue;
+                }
+
+                if (strcmp(link->tonode->idname, "ShaderNodeGroup") == 0) continue;
+                if (strcmp(link->fromnode->idname, "ShaderNodeGroup") == 0)
+                {
+                    auto& src_output_map = group_output_maps[link->fromnode->name];
+                    auto it              = src_output_map.find(link->fromsock->identifier);
+                    if (it != src_output_map.end())
+                    {
+                        shader_link_t link_data;
+                        link_data.from_node   = it->second.node_name;
+                        link_data.from_socket = it->second.socket_id;
+                        link_data.to_node     = prefix + link->tonode->name;
+                        link_data.to_socket   = link->tosock->identifier;
+                        material_data.links.push_back(link_data);
+                    }
+                    continue;
+                }
+
+                shader_link_t link_data;
+                link_data.from_node   = prefix + link->fromnode->name;
+                link_data.from_socket = link->fromsock->identifier;
+                link_data.to_node     = prefix + link->tonode->name;
+                link_data.to_socket   = link->tosock->identifier;
+                material_data.links.push_back(link_data);
+            }
+
+            // Fourth pass: add links from input mappings for nodes that read from GroupInput
+            LISTBASE_FOREACH(bNodeLink*, link, &tree->links)
+            {
+                if (!link->fromnode || !link->tonode || !link->fromsock || !link->tosock) continue;
+
+                if (strcmp(link->fromnode->idname, "NodeGroupInput") == 0 && strcmp(link->tonode->idname, "NodeGroupOutput") != 0 && strcmp(link->tonode->idname, "ShaderNodeGroup") != 0)
+                {
+                    auto it = input_mappings.find(link->fromsock->identifier);
+                    if (it != input_mappings.end())
+                    {
+                        shader_link_t link_data;
+                        link_data.from_node   = it->second.node_name;
+                        link_data.from_socket = it->second.socket_id;
+                        link_data.to_node     = prefix + link->tonode->name;
+                        link_data.to_socket   = link->tosock->identifier;
+                        material_data.links.push_back(link_data);
+                    }
+                }
+            }
+        };
+
+        // Process each material
         LISTBASE_FOREACH(Material*, mat, &bmain->materials)
         {
             if (mat->nodetree == nullptr) continue;
@@ -220,46 +408,10 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
             material_t material_data;
             material_data.name = mat->id.name;
 
-            // Iterate through all nodes in the shader graph
-            LISTBASE_FOREACH(bNode*, node, &mat->nodetree->nodes)
-            {
-                shader_node_t node_data;
-                node_data.idname = node->idname;
+            std::map<std::string, socket_endpoint_t> input_mappings;
+            std::map<std::string, socket_endpoint_t> output_mappings;
 
-                // Input sockets
-                LISTBASE_FOREACH(bNodeSocket*, socket, &node->inputs)
-                {
-                    shader_node_socket_t socket_data;
-                    socket_data.identifier = socket->identifier;
-                    socket_data.idname     = socket->idname;
-                    node_data.inputs.push_back(socket_data);
-                }
-
-                // Output sockets
-                LISTBASE_FOREACH(bNodeSocket*, socket, &node->outputs)
-                {
-                    shader_node_socket_t socket_data;
-                    socket_data.identifier = socket->identifier;
-                    socket_data.idname     = socket->idname;
-                    node_data.outputs.push_back(socket_data);
-                }
-
-                material_data.nodes.push_back(node_data);
-            }
-
-            // Iterate through all links in the shader graph
-            LISTBASE_FOREACH(bNodeLink*, link, &mat->nodetree->links)
-            {
-                if (link->fromnode && link->tonode && link->fromsock && link->tosock)
-                {
-                    shader_link_t link_data;
-                    link_data.from_node   = link->fromnode->name;
-                    link_data.from_socket = link->fromsock->identifier;
-                    link_data.to_node     = link->tonode->name;
-                    link_data.to_socket   = link->tosock->identifier;
-                    material_data.links.push_back(link_data);
-                }
-            }
+            flatten_node_tree(mat->nodetree, "", material_data, input_mappings, output_mappings);
 
             data.materials[material_data.name] = std::move(material_data);
         }
@@ -598,7 +750,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
             for (size_t i = 0; i < mat.nodes.size(); i++)
             {
                 const auto& node = mat.nodes[i];
-                fprintf(log_file, "    node[%zu]: %s (inputs=%zu, outputs=%zu)\n", i, node.idname.c_str(), node.inputs.size(), node.outputs.size());
+                fprintf(log_file, "    node[%zu]: %s [%s] (inputs=%zu, outputs=%zu)\n", i, node.name.c_str(), node.idname.c_str(), node.inputs.size(), node.outputs.size());
                 for (const auto& input : node.inputs)
                 {
                     fprintf(log_file, "      in: %s (%s)\n", input.identifier.c_str(), input.idname.c_str());
