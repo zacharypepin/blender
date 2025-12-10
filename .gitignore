@@ -87,3 +87,6 @@ compile_commands.json
 blendcache_*
 *.blend1
 *.blend2
+
+# local build folder
+build_dev/
