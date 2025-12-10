@@ -6,6 +6,7 @@
 #include <functional>
 #include <map>
 #include <optional>
+#include <queue>
 #include <set>
 #include <unordered_map>
 #include <variant>
@@ -934,6 +935,70 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 }
             }
 
+            // Topological sort: dependencies before dependents, Principled BSDF at the end
+            {
+                // Build adjacency list and in-degree count
+                std::unordered_map<std::string, std::vector<std::string>> dependents;
+                std::unordered_map<std::string, int> in_degree;
+
+                // Initialize all nodes with in_degree 0
+                for (const auto& node : filtered_nodes)
+                {
+                    in_degree[node.name] = 0;
+                }
+
+                // Build graph from links
+                for (const auto& link : filtered_links)
+                {
+                    dependents[link.from_node].push_back(link.to_node);
+                    in_degree[link.to_node]++;
+                }
+
+                // Kahn's algorithm
+                std::queue<std::string> queue;
+                for (const auto& [name, degree] : in_degree)
+                {
+                    if (degree == 0)
+                    {
+                        queue.push(name);
+                    }
+                }
+
+                std::vector<std::string> sorted_order;
+                while (!queue.empty())
+                {
+                    std::string current = queue.front();
+                    queue.pop();
+                    sorted_order.push_back(current);
+
+                    for (const auto& dependent : dependents[current])
+                    {
+                        in_degree[dependent]--;
+                        if (in_degree[dependent] == 0)
+                        {
+                            queue.push(dependent);
+                        }
+                    }
+                }
+
+                // Reorder filtered_nodes according to sorted_order
+                std::unordered_map<std::string, shader_node_t> node_map;
+                for (auto& node : filtered_nodes)
+                {
+                    node_map[node.name] = std::move(node);
+                }
+
+                filtered_nodes.clear();
+                for (const auto& name : sorted_order)
+                {
+                    auto it = node_map.find(name);
+                    if (it != node_map.end())
+                    {
+                        filtered_nodes.push_back(std::move(it->second));
+                    }
+                }
+            }
+
             material_data.nodes                = std::move(filtered_nodes);
             material_data.links                = std::move(filtered_links);
 
@@ -1497,7 +1562,725 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
 
     // ===============================================================================================
     // ===============================================================================================
-    // Extract meshes and write to bb_archive
+    // Extract shader graphs
+    // ===============================================================================================
+    // ===============================================================================================
+    std::vector<BBArchiveShaderGraph> bb_shaders;
+    {
+        // Map Blender node idname to bb_shader_node_type_e
+        auto get_node_type = [](const std::string& idname) -> std::optional<bb_shader_node_type_e>
+        {
+            static const std::unordered_map<std::string, bb_shader_node_type_e> node_type_map = {
+                {             "ShaderNodeUVMap",              BB_SHADER_NODE_TYPE_UV_MAP},
+                {              "ShaderNodeMath",                BB_SHADER_NODE_TYPE_MATH},
+                {        "ShaderNodeVectorMath",         BB_SHADER_NODE_TYPE_VECTOR_MATH},
+                {               "ShaderNodeMix",                 BB_SHADER_NODE_TYPE_MIX},
+                {     "ShaderNodeSeparateColor",      BB_SHADER_NODE_TYPE_SEPARATE_COLOR},
+                {      "ShaderNodeCombineColor",       BB_SHADER_NODE_TYPE_COMBINE_COLOR},
+                {          "ShaderNodeTexNoise",           BB_SHADER_NODE_TYPE_TEX_NOISE},
+                {          "ShaderNodeTexImage",           BB_SHADER_NODE_TYPE_TEX_IMAGE},
+                {          "ShaderNodeValToRGB",          BB_SHADER_NODE_TYPE_VAL_TO_RGB},
+                {  "ShaderNodeAmbientOcclusion",   BB_SHADER_NODE_TYPE_AMBIENT_OCCLUSION},
+                {              "ShaderNodeBump",                BB_SHADER_NODE_TYPE_BUMP},
+                {             "ShaderNodeClamp",               BB_SHADER_NODE_TYPE_CLAMP},
+                {      "ShaderNodeDisplacement",        BB_SHADER_NODE_TYPE_DISPLACEMENT},
+                {          "ShaderNodeMapRange",           BB_SHADER_NODE_TYPE_MAP_RANGE},
+                {           "ShaderNodeMapping",             BB_SHADER_NODE_TYPE_MAPPING},
+                {         "ShaderNodeNormalMap",          BB_SHADER_NODE_TYPE_NORMAL_MAP},
+                {           "ShaderNodeTangent",             BB_SHADER_NODE_TYPE_TANGENT},
+                {          "ShaderNodeTexBrick",           BB_SHADER_NODE_TYPE_TEX_BRICK},
+                {    "ShaderNodeTexEnvironment",     BB_SHADER_NODE_TYPE_TEX_ENVIRONMENT},
+                {          "ShaderNodeTexGabor",           BB_SHADER_NODE_TYPE_TEX_GABOR},
+                {       "ShaderNodeTexGradient",        BB_SHADER_NODE_TYPE_TEX_GRADIENT},
+                {          "ShaderNodeTexMagic",           BB_SHADER_NODE_TYPE_TEX_MAGIC},
+                {        "ShaderNodeTexVoronoi",         BB_SHADER_NODE_TYPE_TEX_VORONOI},
+                {           "ShaderNodeTexWave",            BB_SHADER_NODE_TYPE_TEX_WAVE},
+                {     "ShaderNodeTexWhiteNoise",     BB_SHADER_NODE_TYPE_TEX_WHITE_NOISE},
+                {"ShaderNodeVectorDisplacement", BB_SHADER_NODE_TYPE_VECTOR_DISPLACEMENT},
+                {      "ShaderNodeVectorRotate",       BB_SHADER_NODE_TYPE_VECTOR_ROTATE},
+                {   "ShaderNodeVectorTransform",    BB_SHADER_NODE_TYPE_VECTOR_TRANSFORM},
+                {             "ShaderNodeValue",               BB_SHADER_NODE_TYPE_VALUE},
+                {             "ShaderNodeGamma",               BB_SHADER_NODE_TYPE_GAMMA},
+                {        "ShaderNodeCombineXYZ",         BB_SHADER_NODE_TYPE_COMBINE_XYZ},
+                {       "ShaderNodeSeparateXYZ",        BB_SHADER_NODE_TYPE_SEPARATE_XYZ},
+                {               "ShaderNodeRGB",                 BB_SHADER_NODE_TYPE_RGB},
+                {    "ShaderNodeBrightContrast",     BB_SHADER_NODE_TYPE_BRIGHT_CONTRAST},
+                {           "ShaderNodeRGBToBW",           BB_SHADER_NODE_TYPE_RGB_TO_BW},
+                {     "ShaderNodeHueSaturation",      BB_SHADER_NODE_TYPE_HUE_SATURATION},
+                {            "ShaderNodeInvert",              BB_SHADER_NODE_TYPE_INVERT},
+                {           "ShaderNodeFresnel",             BB_SHADER_NODE_TYPE_FRESNEL},
+                {    "ShaderNodeOutputMaterial",              BB_SHADER_NODE_TYPE_OUTPUT},
+                {          "ShaderNodeTexCoord",               BB_SHADER_NODE_TYPE_INPUT},
+            };
+            auto it = node_type_map.find(idname);
+            if (it != node_type_map.end()) return it->second;
+            return std::nullopt;
+        };
+
+        // Map socket identifier to input field type based on node type
+        auto get_input_field = [](bb_shader_node_type_e node_type, const std::string& socket_id) -> std::optional<bb_shader_input_field_type_e>
+        {
+            // Output node inputs
+            if (node_type == BB_SHADER_NODE_TYPE_OUTPUT)
+            {
+                if (socket_id == "Base Color") return BB_SHADER_INPUT_FIELD_OUTPUT_BASE_COLOUR;
+                if (socket_id == "Emission Color") return BB_SHADER_INPUT_FIELD_OUTPUT_EMISSION;
+                if (socket_id == "Emission Strength") return BB_SHADER_INPUT_FIELD_OUTPUT_EMISSION_STRENGTH;
+                if (socket_id == "Roughness") return BB_SHADER_INPUT_FIELD_OUTPUT_ROUGHNESS;
+                if (socket_id == "Metallic") return BB_SHADER_INPUT_FIELD_OUTPUT_METALLIC;
+                if (socket_id == "Specular IOR Level") return BB_SHADER_INPUT_FIELD_OUTPUT_SPECULAR;
+                if (socket_id == "Normal") return BB_SHADER_INPUT_FIELD_OUTPUT_NORMAL;
+                if (socket_id == "Alpha") return BB_SHADER_INPUT_FIELD_OUTPUT_ALPHA;
+            }
+            // Math node
+            if (node_type == BB_SHADER_NODE_TYPE_MATH)
+            {
+                if (socket_id == "Value") return BB_SHADER_INPUT_FIELD_MATH_VALUE;
+                if (socket_id == "Value_001") return BB_SHADER_INPUT_FIELD_MATH_VALUE_001;
+                if (socket_id == "Value_002") return BB_SHADER_INPUT_FIELD_MATH_VALUE_002;
+            }
+            // Vector Math node
+            if (node_type == BB_SHADER_NODE_TYPE_VECTOR_MATH)
+            {
+                if (socket_id == "Vector") return BB_SHADER_INPUT_FIELD_VECTOR_MATH_VECTOR;
+                if (socket_id == "Vector_001") return BB_SHADER_INPUT_FIELD_VECTOR_MATH_VECTOR_001;
+                if (socket_id == "Vector_002") return BB_SHADER_INPUT_FIELD_VECTOR_MATH_VECTOR_002;
+                if (socket_id == "Scale") return BB_SHADER_INPUT_FIELD_VECTOR_MATH_SCALE;
+            }
+            // Mix node
+            if (node_type == BB_SHADER_NODE_TYPE_MIX)
+            {
+                if (socket_id == "Factor_Float") return BB_SHADER_INPUT_FIELD_MIX_FACTOR_FLOAT;
+                if (socket_id == "Factor_Vector") return BB_SHADER_INPUT_FIELD_MIX_FACTOR_VECTOR;
+                if (socket_id == "A_Float") return BB_SHADER_INPUT_FIELD_MIX_A_FLOAT;
+                if (socket_id == "B_Float") return BB_SHADER_INPUT_FIELD_MIX_B_FLOAT;
+                if (socket_id == "A_Vector") return BB_SHADER_INPUT_FIELD_MIX_A_VECTOR;
+                if (socket_id == "B_Vector") return BB_SHADER_INPUT_FIELD_MIX_B_VECTOR;
+                if (socket_id == "A_Color") return BB_SHADER_INPUT_FIELD_MIX_A_COLOR;
+                if (socket_id == "B_Color") return BB_SHADER_INPUT_FIELD_MIX_B_COLOR;
+                if (socket_id == "A_Rotation") return BB_SHADER_INPUT_FIELD_MIX_A_ROTATION;
+                if (socket_id == "B_Rotation") return BB_SHADER_INPUT_FIELD_MIX_B_ROTATION;
+            }
+            // Separate/Combine Color
+            if (node_type == BB_SHADER_NODE_TYPE_SEPARATE_COLOR)
+            {
+                if (socket_id == "Color") return BB_SHADER_INPUT_FIELD_SEPARATE_COLOR_COLOR;
+            }
+            if (node_type == BB_SHADER_NODE_TYPE_COMBINE_COLOR)
+            {
+                if (socket_id == "Red") return BB_SHADER_INPUT_FIELD_COMBINE_COLOR_RED;
+                if (socket_id == "Green") return BB_SHADER_INPUT_FIELD_COMBINE_COLOR_GREEN;
+                if (socket_id == "Blue") return BB_SHADER_INPUT_FIELD_COMBINE_COLOR_BLUE;
+            }
+            // Separate/Combine XYZ
+            if (node_type == BB_SHADER_NODE_TYPE_SEPARATE_XYZ)
+            {
+                if (socket_id == "Vector") return BB_SHADER_INPUT_FIELD_SEPARATE_XYZ_VECTOR;
+            }
+            if (node_type == BB_SHADER_NODE_TYPE_COMBINE_XYZ)
+            {
+                if (socket_id == "X") return BB_SHADER_INPUT_FIELD_COMBINE_XYZ_X;
+                if (socket_id == "Y") return BB_SHADER_INPUT_FIELD_COMBINE_XYZ_Y;
+                if (socket_id == "Z") return BB_SHADER_INPUT_FIELD_COMBINE_XYZ_Z;
+            }
+            // Tex Noise
+            if (node_type == BB_SHADER_NODE_TYPE_TEX_NOISE)
+            {
+                if (socket_id == "Vector") return BB_SHADER_INPUT_FIELD_TEX_NOISE_VECTOR;
+                if (socket_id == "W") return BB_SHADER_INPUT_FIELD_TEX_NOISE_W;
+                if (socket_id == "Scale") return BB_SHADER_INPUT_FIELD_TEX_NOISE_SCALE;
+                if (socket_id == "Detail") return BB_SHADER_INPUT_FIELD_TEX_NOISE_DETAIL;
+                if (socket_id == "Roughness") return BB_SHADER_INPUT_FIELD_TEX_NOISE_ROUGHNESS;
+                if (socket_id == "Lacunarity") return BB_SHADER_INPUT_FIELD_TEX_NOISE_LACUNARITY;
+                if (socket_id == "Offset") return BB_SHADER_INPUT_FIELD_TEX_NOISE_OFFSET;
+                if (socket_id == "Gain") return BB_SHADER_INPUT_FIELD_TEX_NOISE_GAIN;
+                if (socket_id == "Distortion") return BB_SHADER_INPUT_FIELD_TEX_NOISE_DISTORTION;
+            }
+            // Tex Image
+            if (node_type == BB_SHADER_NODE_TYPE_TEX_IMAGE)
+            {
+                if (socket_id == "Vector") return BB_SHADER_INPUT_FIELD_TEX_IMAGE_VECTOR;
+            }
+            // Val To RGB
+            if (node_type == BB_SHADER_NODE_TYPE_VAL_TO_RGB)
+            {
+                if (socket_id == "Fac") return BB_SHADER_INPUT_FIELD_VAL_TO_RGB_FAC;
+            }
+            // Ambient Occlusion
+            if (node_type == BB_SHADER_NODE_TYPE_AMBIENT_OCCLUSION)
+            {
+                if (socket_id == "Color") return BB_SHADER_INPUT_FIELD_AMBIENT_OCCLUSION_COLOR;
+                if (socket_id == "Distance") return BB_SHADER_INPUT_FIELD_AMBIENT_OCCLUSION_DISTANCE;
+                if (socket_id == "Normal") return BB_SHADER_INPUT_FIELD_AMBIENT_OCCLUSION_NORMAL;
+            }
+            // Bump
+            if (node_type == BB_SHADER_NODE_TYPE_BUMP)
+            {
+                if (socket_id == "Strength") return BB_SHADER_INPUT_FIELD_BUMP_STRENGTH;
+                if (socket_id == "Distance") return BB_SHADER_INPUT_FIELD_BUMP_DISTANCE;
+                if (socket_id == "Filter Width") return BB_SHADER_INPUT_FIELD_BUMP_FILTER_WIDTH;
+                if (socket_id == "Height") return BB_SHADER_INPUT_FIELD_BUMP_HEIGHT;
+                if (socket_id == "Normal") return BB_SHADER_INPUT_FIELD_BUMP_NORMAL;
+            }
+            // Clamp
+            if (node_type == BB_SHADER_NODE_TYPE_CLAMP)
+            {
+                if (socket_id == "Value") return BB_SHADER_INPUT_FIELD_CLAMP_VALUE;
+                if (socket_id == "Min") return BB_SHADER_INPUT_FIELD_CLAMP_MIN;
+                if (socket_id == "Max") return BB_SHADER_INPUT_FIELD_CLAMP_MAX;
+            }
+            // Displacement
+            if (node_type == BB_SHADER_NODE_TYPE_DISPLACEMENT)
+            {
+                if (socket_id == "Height") return BB_SHADER_INPUT_FIELD_DISPLACEMENT_HEIGHT;
+                if (socket_id == "Midlevel") return BB_SHADER_INPUT_FIELD_DISPLACEMENT_MIDLEVEL;
+                if (socket_id == "Scale") return BB_SHADER_INPUT_FIELD_DISPLACEMENT_SCALE;
+                if (socket_id == "Normal") return BB_SHADER_INPUT_FIELD_DISPLACEMENT_NORMAL;
+            }
+            // Map Range
+            if (node_type == BB_SHADER_NODE_TYPE_MAP_RANGE)
+            {
+                if (socket_id == "Value") return BB_SHADER_INPUT_FIELD_MAP_RANGE_VALUE;
+                if (socket_id == "From Min") return BB_SHADER_INPUT_FIELD_MAP_RANGE_FROM_MIN;
+                if (socket_id == "From Max") return BB_SHADER_INPUT_FIELD_MAP_RANGE_FROM_MAX;
+                if (socket_id == "To Min") return BB_SHADER_INPUT_FIELD_MAP_RANGE_TO_MIN;
+                if (socket_id == "To Max") return BB_SHADER_INPUT_FIELD_MAP_RANGE_TO_MAX;
+                if (socket_id == "Steps") return BB_SHADER_INPUT_FIELD_MAP_RANGE_STEPS;
+                if (socket_id == "Vector") return BB_SHADER_INPUT_FIELD_MAP_RANGE_VECTOR;
+                if (socket_id == "From_Min_FLOAT3") return BB_SHADER_INPUT_FIELD_MAP_RANGE_FROM_MIN_FLOAT3;
+                if (socket_id == "From_Max_FLOAT3") return BB_SHADER_INPUT_FIELD_MAP_RANGE_FROM_MAX_FLOAT3;
+                if (socket_id == "To_Min_FLOAT3") return BB_SHADER_INPUT_FIELD_MAP_RANGE_TO_MIN_FLOAT3;
+                if (socket_id == "To_Max_FLOAT3") return BB_SHADER_INPUT_FIELD_MAP_RANGE_TO_MAX_FLOAT3;
+                if (socket_id == "Steps_FLOAT3") return BB_SHADER_INPUT_FIELD_MAP_RANGE_STEPS_FLOAT3;
+            }
+            // Mapping
+            if (node_type == BB_SHADER_NODE_TYPE_MAPPING)
+            {
+                if (socket_id == "Vector") return BB_SHADER_INPUT_FIELD_MAPPING_VECTOR;
+                if (socket_id == "Location") return BB_SHADER_INPUT_FIELD_MAPPING_LOCATION;
+                if (socket_id == "Rotation") return BB_SHADER_INPUT_FIELD_MAPPING_ROTATION;
+                if (socket_id == "Scale") return BB_SHADER_INPUT_FIELD_MAPPING_SCALE;
+            }
+            // Normal Map
+            if (node_type == BB_SHADER_NODE_TYPE_NORMAL_MAP)
+            {
+                if (socket_id == "Strength") return BB_SHADER_INPUT_FIELD_NORMAL_MAP_STRENGTH;
+                if (socket_id == "Color") return BB_SHADER_INPUT_FIELD_NORMAL_MAP_COLOR;
+            }
+            // Tex Brick
+            if (node_type == BB_SHADER_NODE_TYPE_TEX_BRICK)
+            {
+                if (socket_id == "Vector") return BB_SHADER_INPUT_FIELD_TEX_BRICK_VECTOR;
+                if (socket_id == "Color1") return BB_SHADER_INPUT_FIELD_TEX_BRICK_COLOR1;
+                if (socket_id == "Color2") return BB_SHADER_INPUT_FIELD_TEX_BRICK_COLOR2;
+                if (socket_id == "Mortar") return BB_SHADER_INPUT_FIELD_TEX_BRICK_MORTAR;
+                if (socket_id == "Scale") return BB_SHADER_INPUT_FIELD_TEX_BRICK_SCALE;
+                if (socket_id == "Mortar Size") return BB_SHADER_INPUT_FIELD_TEX_BRICK_MORTAR_SIZE;
+                if (socket_id == "Mortar Smooth") return BB_SHADER_INPUT_FIELD_TEX_BRICK_MORTAR_SMOOTH;
+                if (socket_id == "Bias") return BB_SHADER_INPUT_FIELD_TEX_BRICK_BIAS;
+                if (socket_id == "Brick Width") return BB_SHADER_INPUT_FIELD_TEX_BRICK_BRICK_WIDTH;
+                if (socket_id == "Row Height") return BB_SHADER_INPUT_FIELD_TEX_BRICK_ROW_HEIGHT;
+            }
+            // Gamma
+            if (node_type == BB_SHADER_NODE_TYPE_GAMMA)
+            {
+                if (socket_id == "Color") return BB_SHADER_INPUT_FIELD_GAMMA_COLOR;
+                if (socket_id == "Gamma") return BB_SHADER_INPUT_FIELD_GAMMA_GAMMA;
+            }
+            // Bright Contrast
+            if (node_type == BB_SHADER_NODE_TYPE_BRIGHT_CONTRAST)
+            {
+                if (socket_id == "Color") return BB_SHADER_INPUT_FIELD_BRIGHT_CONTRAST_COLOR;
+                if (socket_id == "Bright") return BB_SHADER_INPUT_FIELD_BRIGHT_CONTRAST_BRIGHT;
+                if (socket_id == "Contrast") return BB_SHADER_INPUT_FIELD_BRIGHT_CONTRAST_CONTRAST;
+            }
+            // RGB to BW
+            if (node_type == BB_SHADER_NODE_TYPE_RGB_TO_BW)
+            {
+                if (socket_id == "Color") return BB_SHADER_INPUT_FIELD_RGB_TO_BW_COLOR;
+            }
+            // Hue Saturation
+            if (node_type == BB_SHADER_NODE_TYPE_HUE_SATURATION)
+            {
+                if (socket_id == "Hue") return BB_SHADER_INPUT_FIELD_HUE_SATURATION_HUE;
+                if (socket_id == "Saturation") return BB_SHADER_INPUT_FIELD_HUE_SATURATION_SATURATION;
+                if (socket_id == "Value") return BB_SHADER_INPUT_FIELD_HUE_SATURATION_VALUE;
+                if (socket_id == "Fac") return BB_SHADER_INPUT_FIELD_HUE_SATURATION_FAC;
+                if (socket_id == "Color") return BB_SHADER_INPUT_FIELD_HUE_SATURATION_COLOR;
+            }
+            // Invert
+            if (node_type == BB_SHADER_NODE_TYPE_INVERT)
+            {
+                if (socket_id == "Fac") return BB_SHADER_INPUT_FIELD_INVERT_FAC;
+                if (socket_id == "Color") return BB_SHADER_INPUT_FIELD_INVERT_COLOR;
+            }
+            // Fresnel
+            if (node_type == BB_SHADER_NODE_TYPE_FRESNEL)
+            {
+                if (socket_id == "IOR") return BB_SHADER_INPUT_FIELD_FRESNEL_IOR;
+                if (socket_id == "Normal") return BB_SHADER_INPUT_FIELD_FRESNEL_NORMAL;
+            }
+            // Value
+            if (node_type == BB_SHADER_NODE_TYPE_VALUE)
+            {
+                if (socket_id == "Value") return BB_SHADER_INPUT_FIELD_VALUE_VALUE;
+            }
+            // RGB
+            if (node_type == BB_SHADER_NODE_TYPE_RGB)
+            {
+                if (socket_id == "Color") return BB_SHADER_INPUT_FIELD_RGB_COLOR;
+            }
+            return std::nullopt;
+        };
+
+        // Map socket identifier to output field type
+        auto get_output_field = [](bb_shader_node_type_e node_type, const std::string& socket_id) -> std::optional<bb_shader_output_field_type_e>
+        {
+            // Input node outputs
+            if (node_type == BB_SHADER_NODE_TYPE_INPUT)
+            {
+                if (socket_id == "Object") return BB_SHADER_OUTPUT_FIELD_INPUT_POSITION;
+                if (socket_id == "Generated") return BB_SHADER_OUTPUT_FIELD_INPUT_GENERATED;
+                if (socket_id == "Normal") return BB_SHADER_OUTPUT_FIELD_INPUT_NORMAL;
+                if (socket_id == "UV") return BB_SHADER_OUTPUT_FIELD_INPUT_UV0;
+            }
+            // UV Map
+            if (node_type == BB_SHADER_NODE_TYPE_UV_MAP)
+            {
+                if (socket_id == "UV") return BB_SHADER_OUTPUT_FIELD_UV_MAP_UV;
+            }
+            // Math
+            if (node_type == BB_SHADER_NODE_TYPE_MATH)
+            {
+                if (socket_id == "Value") return BB_SHADER_OUTPUT_FIELD_MATH_VALUE;
+            }
+            // Vector Math
+            if (node_type == BB_SHADER_NODE_TYPE_VECTOR_MATH)
+            {
+                if (socket_id == "Vector") return BB_SHADER_OUTPUT_FIELD_VECTOR_MATH_VECTOR;
+                if (socket_id == "Value") return BB_SHADER_OUTPUT_FIELD_VECTOR_MATH_VALUE;
+            }
+            // Mix
+            if (node_type == BB_SHADER_NODE_TYPE_MIX)
+            {
+                if (socket_id == "Result_Float") return BB_SHADER_OUTPUT_FIELD_MIX_RESULT_FLOAT;
+                if (socket_id == "Result_Vector") return BB_SHADER_OUTPUT_FIELD_MIX_RESULT_VECTOR;
+                if (socket_id == "Result_Color") return BB_SHADER_OUTPUT_FIELD_MIX_RESULT_COLOR;
+                if (socket_id == "Result_Rotation") return BB_SHADER_OUTPUT_FIELD_MIX_RESULT_ROTATION;
+            }
+            // Separate Color
+            if (node_type == BB_SHADER_NODE_TYPE_SEPARATE_COLOR)
+            {
+                if (socket_id == "Red") return BB_SHADER_OUTPUT_FIELD_SEPARATE_COLOR_RED;
+                if (socket_id == "Green") return BB_SHADER_OUTPUT_FIELD_SEPARATE_COLOR_GREEN;
+                if (socket_id == "Blue") return BB_SHADER_OUTPUT_FIELD_SEPARATE_COLOR_BLUE;
+            }
+            // Combine Color
+            if (node_type == BB_SHADER_NODE_TYPE_COMBINE_COLOR)
+            {
+                if (socket_id == "Color") return BB_SHADER_OUTPUT_FIELD_COMBINE_COLOR_COLOR;
+            }
+            // Separate/Combine XYZ
+            if (node_type == BB_SHADER_NODE_TYPE_SEPARATE_XYZ)
+            {
+                if (socket_id == "X") return BB_SHADER_OUTPUT_FIELD_SEPARATE_XYZ_X;
+                if (socket_id == "Y") return BB_SHADER_OUTPUT_FIELD_SEPARATE_XYZ_Y;
+                if (socket_id == "Z") return BB_SHADER_OUTPUT_FIELD_SEPARATE_XYZ_Z;
+            }
+            if (node_type == BB_SHADER_NODE_TYPE_COMBINE_XYZ)
+            {
+                if (socket_id == "Vector") return BB_SHADER_OUTPUT_FIELD_COMBINE_XYZ_VECTOR;
+            }
+            // Tex Noise
+            if (node_type == BB_SHADER_NODE_TYPE_TEX_NOISE)
+            {
+                if (socket_id == "Fac") return BB_SHADER_OUTPUT_FIELD_TEX_NOISE_FAC;
+                if (socket_id == "Color") return BB_SHADER_OUTPUT_FIELD_TEX_NOISE_COLOR;
+            }
+            // Tex Image
+            if (node_type == BB_SHADER_NODE_TYPE_TEX_IMAGE)
+            {
+                if (socket_id == "Color") return BB_SHADER_OUTPUT_FIELD_TEX_IMAGE_COLOR;
+                if (socket_id == "Alpha") return BB_SHADER_OUTPUT_FIELD_TEX_IMAGE_ALPHA;
+            }
+            // Val To RGB
+            if (node_type == BB_SHADER_NODE_TYPE_VAL_TO_RGB)
+            {
+                if (socket_id == "Color") return BB_SHADER_OUTPUT_FIELD_VAL_TO_RGB_COLOR;
+                if (socket_id == "Alpha") return BB_SHADER_OUTPUT_FIELD_VAL_TO_RGB_ALPHA;
+            }
+            // Ambient Occlusion
+            if (node_type == BB_SHADER_NODE_TYPE_AMBIENT_OCCLUSION)
+            {
+                if (socket_id == "Color") return BB_SHADER_OUTPUT_FIELD_AMBIENT_OCCLUSION_COLOR;
+                if (socket_id == "AO") return BB_SHADER_OUTPUT_FIELD_AMBIENT_OCCLUSION_AO;
+            }
+            // Bump
+            if (node_type == BB_SHADER_NODE_TYPE_BUMP)
+            {
+                if (socket_id == "Normal") return BB_SHADER_OUTPUT_FIELD_BUMP_NORMAL;
+            }
+            // Clamp
+            if (node_type == BB_SHADER_NODE_TYPE_CLAMP)
+            {
+                if (socket_id == "Result") return BB_SHADER_OUTPUT_FIELD_CLAMP_RESULT;
+            }
+            // Displacement
+            if (node_type == BB_SHADER_NODE_TYPE_DISPLACEMENT)
+            {
+                if (socket_id == "Displacement") return BB_SHADER_OUTPUT_FIELD_DISPLACEMENT_DISPLACEMENT;
+            }
+            // Map Range
+            if (node_type == BB_SHADER_NODE_TYPE_MAP_RANGE)
+            {
+                if (socket_id == "Result") return BB_SHADER_OUTPUT_FIELD_MAP_RANGE_RESULT;
+                if (socket_id == "Vector") return BB_SHADER_OUTPUT_FIELD_MAP_RANGE_VECTOR;
+            }
+            // Mapping
+            if (node_type == BB_SHADER_NODE_TYPE_MAPPING)
+            {
+                if (socket_id == "Vector") return BB_SHADER_OUTPUT_FIELD_MAPPING_VECTOR;
+            }
+            // Normal Map
+            if (node_type == BB_SHADER_NODE_TYPE_NORMAL_MAP)
+            {
+                if (socket_id == "Normal") return BB_SHADER_OUTPUT_FIELD_NORMAL_MAP_NORMAL;
+            }
+            // Tangent
+            if (node_type == BB_SHADER_NODE_TYPE_TANGENT)
+            {
+                if (socket_id == "Tangent") return BB_SHADER_OUTPUT_FIELD_TANGENT_TANGENT;
+            }
+            // Tex Brick
+            if (node_type == BB_SHADER_NODE_TYPE_TEX_BRICK)
+            {
+                if (socket_id == "Color") return BB_SHADER_OUTPUT_FIELD_TEX_BRICK_COLOR;
+                if (socket_id == "Fac") return BB_SHADER_OUTPUT_FIELD_TEX_BRICK_FAC;
+            }
+            // Gamma
+            if (node_type == BB_SHADER_NODE_TYPE_GAMMA)
+            {
+                if (socket_id == "Color") return BB_SHADER_OUTPUT_FIELD_GAMMA_COLOR;
+            }
+            // Bright Contrast
+            if (node_type == BB_SHADER_NODE_TYPE_BRIGHT_CONTRAST)
+            {
+                if (socket_id == "Color") return BB_SHADER_OUTPUT_FIELD_BRIGHT_CONTRAST_COLOR;
+            }
+            // RGB to BW
+            if (node_type == BB_SHADER_NODE_TYPE_RGB_TO_BW)
+            {
+                if (socket_id == "Val") return BB_SHADER_OUTPUT_FIELD_RGB_TO_BW_VAL;
+            }
+            // Hue Saturation
+            if (node_type == BB_SHADER_NODE_TYPE_HUE_SATURATION)
+            {
+                if (socket_id == "Color") return BB_SHADER_OUTPUT_FIELD_HUE_SATURATION_COLOR;
+            }
+            // Invert
+            if (node_type == BB_SHADER_NODE_TYPE_INVERT)
+            {
+                if (socket_id == "Color") return BB_SHADER_OUTPUT_FIELD_INVERT_COLOR;
+            }
+            // Fresnel
+            if (node_type == BB_SHADER_NODE_TYPE_FRESNEL)
+            {
+                if (socket_id == "Fac") return BB_SHADER_OUTPUT_FIELD_FRESNEL_FAC;
+            }
+            // Value
+            if (node_type == BB_SHADER_NODE_TYPE_VALUE)
+            {
+                if (socket_id == "Value") return BB_SHADER_OUTPUT_FIELD_VALUE_VALUE;
+            }
+            // RGB
+            if (node_type == BB_SHADER_NODE_TYPE_RGB)
+            {
+                if (socket_id == "Color") return BB_SHADER_OUTPUT_FIELD_RGB_COLOR;
+            }
+            return std::nullopt;
+        };
+
+        // Map property identifier to input field type
+        auto get_prop_field = [](bb_shader_node_type_e node_type, const std::string& prop_id) -> std::optional<bb_shader_input_field_type_e>
+        {
+            if (node_type == BB_SHADER_NODE_TYPE_MATH)
+            {
+                if (prop_id == "operation") return BB_SHADER_INPUT_FIELD_MATH_OPERATION;
+                if (prop_id == "use_clamp") return BB_SHADER_INPUT_FIELD_MATH_USE_CLAMP;
+            }
+            if (node_type == BB_SHADER_NODE_TYPE_VECTOR_MATH)
+            {
+                if (prop_id == "operation") return BB_SHADER_INPUT_FIELD_VECTOR_MATH_OPERATION;
+            }
+            if (node_type == BB_SHADER_NODE_TYPE_MIX)
+            {
+                if (prop_id == "blend_type") return BB_SHADER_INPUT_FIELD_MIX_BLEND_TYPE;
+                if (prop_id == "clamp_factor") return BB_SHADER_INPUT_FIELD_MIX_CLAMP_FACTOR;
+                if (prop_id == "clamp_result") return BB_SHADER_INPUT_FIELD_MIX_CLAMP_RESULT;
+                if (prop_id == "data_type") return BB_SHADER_INPUT_FIELD_MIX_DATA_TYPE;
+                if (prop_id == "factor_mode") return BB_SHADER_INPUT_FIELD_MIX_FACTOR_MODE;
+            }
+            if (node_type == BB_SHADER_NODE_TYPE_SEPARATE_COLOR)
+            {
+                if (prop_id == "mode") return BB_SHADER_INPUT_FIELD_SEPARATE_COLOR_MODE;
+            }
+            if (node_type == BB_SHADER_NODE_TYPE_COMBINE_COLOR)
+            {
+                if (prop_id == "mode") return BB_SHADER_INPUT_FIELD_COMBINE_COLOR_MODE;
+            }
+            if (node_type == BB_SHADER_NODE_TYPE_TEX_NOISE)
+            {
+                if (prop_id == "noise_dimensions") return BB_SHADER_INPUT_FIELD_TEX_NOISE_NOISE_DIMENSIONS;
+                if (prop_id == "noise_type") return BB_SHADER_INPUT_FIELD_TEX_NOISE_NOISE_TYPE;
+                if (prop_id == "normalize") return BB_SHADER_INPUT_FIELD_TEX_NOISE_NORMALIZE;
+            }
+            if (node_type == BB_SHADER_NODE_TYPE_TEX_IMAGE)
+            {
+                if (prop_id == "interpolation") return BB_SHADER_INPUT_FIELD_TEX_IMAGE_INTERPOLATION;
+                if (prop_id == "projection") return BB_SHADER_INPUT_FIELD_TEX_IMAGE_PROJECTION;
+                if (prop_id == "extension") return BB_SHADER_INPUT_FIELD_TEX_IMAGE_EXTENSION;
+                if (prop_id == "image") return BB_SHADER_INPUT_FIELD_TEX_IMAGE_IMAGE;
+            }
+            if (node_type == BB_SHADER_NODE_TYPE_VAL_TO_RGB)
+            {
+                if (prop_id == "interpolation") return BB_SHADER_INPUT_FIELD_VAL_TO_RGB_INTERPOLATION;
+                if (prop_id == "element_count") return BB_SHADER_INPUT_FIELD_VAL_TO_RGB_ELEMENT_COUNT;
+                if (prop_id == "position_0") return BB_SHADER_INPUT_FIELD_VAL_TO_RGB_POSITION_0;
+                if (prop_id == "position_1") return BB_SHADER_INPUT_FIELD_VAL_TO_RGB_POSITION_1;
+                if (prop_id == "position_2") return BB_SHADER_INPUT_FIELD_VAL_TO_RGB_POSITION_2;
+                if (prop_id == "position_3") return BB_SHADER_INPUT_FIELD_VAL_TO_RGB_POSITION_3;
+                if (prop_id == "position_4") return BB_SHADER_INPUT_FIELD_VAL_TO_RGB_POSITION_4;
+                if (prop_id == "position_5") return BB_SHADER_INPUT_FIELD_VAL_TO_RGB_POSITION_5;
+                if (prop_id == "position_6") return BB_SHADER_INPUT_FIELD_VAL_TO_RGB_POSITION_6;
+                if (prop_id == "position_7") return BB_SHADER_INPUT_FIELD_VAL_TO_RGB_POSITION_7;
+                if (prop_id == "color_0") return BB_SHADER_INPUT_FIELD_VAL_TO_RGB_COLOR_0;
+                if (prop_id == "color_1") return BB_SHADER_INPUT_FIELD_VAL_TO_RGB_COLOR_1;
+                if (prop_id == "color_2") return BB_SHADER_INPUT_FIELD_VAL_TO_RGB_COLOR_2;
+                if (prop_id == "color_3") return BB_SHADER_INPUT_FIELD_VAL_TO_RGB_COLOR_3;
+                if (prop_id == "color_4") return BB_SHADER_INPUT_FIELD_VAL_TO_RGB_COLOR_4;
+                if (prop_id == "color_5") return BB_SHADER_INPUT_FIELD_VAL_TO_RGB_COLOR_5;
+                if (prop_id == "color_6") return BB_SHADER_INPUT_FIELD_VAL_TO_RGB_COLOR_6;
+                if (prop_id == "color_7") return BB_SHADER_INPUT_FIELD_VAL_TO_RGB_COLOR_7;
+            }
+            if (node_type == BB_SHADER_NODE_TYPE_AMBIENT_OCCLUSION)
+            {
+                if (prop_id == "samples") return BB_SHADER_INPUT_FIELD_AMBIENT_OCCLUSION_SAMPLES;
+                if (prop_id == "inside") return BB_SHADER_INPUT_FIELD_AMBIENT_OCCLUSION_INSIDE;
+                if (prop_id == "only_local") return BB_SHADER_INPUT_FIELD_AMBIENT_OCCLUSION_ONLY_LOCAL;
+            }
+            if (node_type == BB_SHADER_NODE_TYPE_BUMP)
+            {
+                if (prop_id == "invert") return BB_SHADER_INPUT_FIELD_BUMP_INVERT;
+            }
+            if (node_type == BB_SHADER_NODE_TYPE_CLAMP)
+            {
+                if (prop_id == "clamp_type") return BB_SHADER_INPUT_FIELD_CLAMP_CLAMP_TYPE;
+            }
+            if (node_type == BB_SHADER_NODE_TYPE_DISPLACEMENT)
+            {
+                if (prop_id == "space") return BB_SHADER_INPUT_FIELD_DISPLACEMENT_SPACE;
+            }
+            if (node_type == BB_SHADER_NODE_TYPE_MAP_RANGE)
+            {
+                if (prop_id == "data_type") return BB_SHADER_INPUT_FIELD_MAP_RANGE_DATA_TYPE;
+                if (prop_id == "interpolation_type") return BB_SHADER_INPUT_FIELD_MAP_RANGE_INTERPOLATION_TYPE;
+                if (prop_id == "clamp") return BB_SHADER_INPUT_FIELD_MAP_RANGE_CLAMP;
+            }
+            if (node_type == BB_SHADER_NODE_TYPE_MAPPING)
+            {
+                if (prop_id == "vector_type") return BB_SHADER_INPUT_FIELD_MAPPING_VECTOR_TYPE;
+            }
+            if (node_type == BB_SHADER_NODE_TYPE_NORMAL_MAP)
+            {
+                if (prop_id == "space") return BB_SHADER_INPUT_FIELD_NORMAL_MAP_SPACE;
+                if (prop_id == "uv_map") return BB_SHADER_INPUT_FIELD_NORMAL_MAP_UV_MAP;
+            }
+            if (node_type == BB_SHADER_NODE_TYPE_TANGENT)
+            {
+                if (prop_id == "direction_type") return BB_SHADER_INPUT_FIELD_TANGENT_DIRECTION_TYPE;
+                if (prop_id == "axis") return BB_SHADER_INPUT_FIELD_TANGENT_AXIS;
+                if (prop_id == "uv_map") return BB_SHADER_INPUT_FIELD_TANGENT_UV_MAP;
+            }
+            if (node_type == BB_SHADER_NODE_TYPE_TEX_BRICK)
+            {
+                if (prop_id == "offset") return BB_SHADER_INPUT_FIELD_TEX_BRICK_OFFSET;
+                if (prop_id == "offset_frequency") return BB_SHADER_INPUT_FIELD_TEX_BRICK_OFFSET_FREQUENCY;
+                if (prop_id == "squash") return BB_SHADER_INPUT_FIELD_TEX_BRICK_SQUASH;
+                if (prop_id == "squash_frequency") return BB_SHADER_INPUT_FIELD_TEX_BRICK_SQUASH_FREQUENCY;
+            }
+            return std::nullopt;
+        };
+
+        // Convert socket_default_value_t to BBArchiveShaderField
+        auto make_field = [&](bb_shader_input_field_type_e field_type, const socket_default_value_t& val) -> BBArchiveShaderField
+        {
+            BBArchiveShaderField field = {};
+            field.field_type           = field_type;
+
+            std::visit(
+                [&](auto&& v)
+                {
+                    using T = std::decay_t<decltype(v)>;
+                    if constexpr (std::is_same_v<T, socket_value_float_t>)
+                    {
+                        field.value_type = BB_SHADER_VALUE_TYPE_FLOAT;
+                        field.float_val  = v.value;
+                    }
+                    else if constexpr (std::is_same_v<T, socket_value_int_t>)
+                    {
+                        field.value_type = BB_SHADER_VALUE_TYPE_INT;
+                        field.int_val    = v.value;
+                    }
+                    else if constexpr (std::is_same_v<T, socket_value_bool_t>)
+                    {
+                        field.value_type = BB_SHADER_VALUE_TYPE_BOOL;
+                        field.bool_val   = v.value ? 1 : 0;
+                    }
+                    else if constexpr (std::is_same_v<T, socket_value_vector_t>)
+                    {
+                        field.value_type  = BB_SHADER_VALUE_TYPE_FLOAT3;
+                        field.vec3_val[0] = v.x;
+                        field.vec3_val[1] = v.y;
+                        field.vec3_val[2] = v.z;
+                    }
+                    else if constexpr (std::is_same_v<T, socket_value_rgba_t>)
+                    {
+                        field.value_type  = BB_SHADER_VALUE_TYPE_FLOAT4;
+                        field.vec4_val[0] = v.r;
+                        field.vec4_val[1] = v.g;
+                        field.vec4_val[2] = v.b;
+                        field.vec4_val[3] = v.a;
+                    }
+                    else if constexpr (std::is_same_v<T, socket_value_string_t>)
+                    {
+                        field.value_type = BB_SHADER_VALUE_TYPE_TEX;
+                        char* str        = (char*)arena_alloc_z(arena, v.value.size() + 1)->data;
+                        memcpy(str, v.value.c_str(), v.value.size() + 1);
+                        field.str_val = str;
+                    }
+                },
+                val
+            );
+
+            return field;
+        };
+
+        bb_shaders.reserve(data.materials.size());
+
+        for (const auto& [mat_name, mat] : data.materials)
+        {
+            // Build node name to index map
+            std::unordered_map<std::string, uint32_t> node_name_to_idx;
+            std::vector<std::pair<const shader_node_t*, bb_shader_node_type_e>> valid_nodes;
+
+            for (const auto& node : mat.nodes)
+            {
+                auto node_type_opt = get_node_type(node.idname);
+                if (node_type_opt.has_value())
+                {
+                    node_name_to_idx[node.name] = valid_nodes.size();
+                    valid_nodes.push_back({&node, node_type_opt.value()});
+                }
+            }
+
+            if (valid_nodes.empty()) continue;
+
+            // Build nodes
+            BBArchiveShaderNode* bb_nodes = (BBArchiveShaderNode*)arena_alloc_z(arena, sizeof(BBArchiveShaderNode) * valid_nodes.size())->data;
+
+            for (size_t i = 0; i < valid_nodes.size(); i++)
+            {
+                const shader_node_t* node    = valid_nodes[i].first;
+                bb_shader_node_type_e n_type = valid_nodes[i].second;
+
+                // Count fields (inputs with default values + props)
+                std::vector<BBArchiveShaderField> fields;
+
+                // Add input socket default values
+                for (const auto& input : node->inputs)
+                {
+                    if (!input.default_value.has_value()) continue;
+                    auto field_opt = get_input_field(n_type, input.identifier);
+                    if (!field_opt.has_value()) continue;
+                    fields.push_back(make_field(field_opt.value(), input.default_value.value()));
+                }
+
+                // Add props
+                for (const auto& prop : node->props)
+                {
+                    auto field_opt = get_prop_field(n_type, prop.identifier);
+                    if (!field_opt.has_value()) continue;
+                    fields.push_back(make_field(field_opt.value(), prop.value));
+                }
+
+                // Allocate and copy fields
+                BBArchiveShaderField* bb_fields = nullptr;
+                if (!fields.empty())
+                {
+                    bb_fields = (BBArchiveShaderField*)arena_alloc_z(arena, sizeof(BBArchiveShaderField) * fields.size())->data;
+                    memcpy(bb_fields, fields.data(), sizeof(BBArchiveShaderField) * fields.size());
+                }
+
+                bb_nodes[i].node_type   = n_type;
+                bb_nodes[i].field_count = fields.size();
+                bb_nodes[i].fields      = bb_fields;
+            }
+
+            // Build links
+            std::vector<BBArchiveShaderLink> links;
+            for (const auto& link : mat.links)
+            {
+                auto src_it = node_name_to_idx.find(link.from_node);
+                auto dst_it = node_name_to_idx.find(link.to_node);
+                if (src_it == node_name_to_idx.end() || dst_it == node_name_to_idx.end()) continue;
+
+                uint32_t src_idx               = src_it->second;
+                uint32_t dst_idx               = dst_it->second;
+                bb_shader_node_type_e src_type = valid_nodes[src_idx].second;
+                bb_shader_node_type_e dst_type = valid_nodes[dst_idx].second;
+
+                auto from_field_opt            = get_output_field(src_type, link.from_socket);
+                auto to_field_opt              = get_input_field(dst_type, link.to_socket);
+                if (!from_field_opt.has_value() || !to_field_opt.has_value()) continue;
+
+                BBArchiveShaderLink bb_link;
+                bb_link.src_idx    = src_idx;
+                bb_link.dst_idx    = dst_idx;
+                bb_link.from_field = from_field_opt.value();
+                bb_link.to_field   = to_field_opt.value();
+                links.push_back(bb_link);
+            }
+
+            // Allocate and copy links
+            BBArchiveShaderLink* bb_links = nullptr;
+            if (!links.empty())
+            {
+                bb_links = (BBArchiveShaderLink*)arena_alloc_z(arena, sizeof(BBArchiveShaderLink) * links.size())->data;
+                memcpy(bb_links, links.data(), sizeof(BBArchiveShaderLink) * links.size());
+            }
+
+            // Allocate shader name
+            char* shader_name = (char*)arena_alloc_z(arena, mat.name.size() + 1)->data;
+            memcpy(shader_name, mat.name.c_str(), mat.name.size() + 1);
+
+            BBArchiveShaderGraph shader_graph;
+            shader_graph.shader_name    = shader_name;
+            shader_graph.node_count     = valid_nodes.size();
+            shader_graph.nodes          = bb_nodes;
+            shader_graph.link_count     = links.size();
+            shader_graph.links          = bb_links;
+            shader_graph.mat_data_count = 0;
+            shader_graph.mat_data       = nullptr;
+
+            bb_shaders.push_back(shader_graph);
+        }
+
+        fprintf(log_file, "[zachary] Exported %zu shader graphs\n", bb_shaders.size());
+    }
+
+    // ===============================================================================================
+    // ===============================================================================================
+    // Write to bb_archive
     // ===============================================================================================
     // ===============================================================================================
     {
@@ -1506,13 +2289,13 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
         info.image_count        = bb_images.size();
         info.skeleton_count     = 0;
         info.animation_count    = 0;
-        info.shader_graph_count = 0;
+        info.shader_graph_count = bb_shaders.size();
         info.scene_count        = bb_scenes.size();
         info.meshes             = meshes;
         info.images             = bb_images.data();
         info.skeletons          = nullptr;
         info.animations         = nullptr;
-        info.shader_graphs      = nullptr;
+        info.shader_graphs      = bb_shaders.data();
         info.scenes             = bb_scenes.data();
 
         bb_archive_write(&info, bb_archive_output_dir);
