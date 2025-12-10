@@ -4,7 +4,7 @@
 #include <cstdio>
 #include <cstring>
 #include <map>
-#include <unordered_set>
+#include <unordered_map>
 #include <vector>
 
 #include "BLI_listbase.h"
@@ -61,8 +61,6 @@ namespace
         vec2_t uv0;
         vec2_t uv1;
         vec2_t uv2;
-        std::array<uint8_t, 4> joint_indices;
-        std::array<float, 4> joint_weights;
     };
 
     struct triangle_t
@@ -87,7 +85,7 @@ namespace
         vec3_t pos;
         vec3_t euler_rot;
         vec3_t scale;
-        mesh_t mesh;
+        std::string mesh_name;
     };
 
     struct scene_t
@@ -136,42 +134,10 @@ namespace
     struct data_t
     {
         std::vector<scene_t> scenes;
-        std::vector<image_t> images;
-        std::vector<material_t> materials;
-        std::vector<std::string> invalid_mesh_names;
+        std::unordered_map<std::string, mesh_t> meshes;
+        std::unordered_map<std::string, image_t> images;
+        std::unordered_map<std::string, material_t> materials;
     };
-}
-
-// =========================================================================================================================================
-// =========================================================================================================================================
-// =========================================================================================================================================
-// =========================================================================================================================================
-static std::string replace_prefix(const char* name, const char* old_prefix, const char* new_prefix)
-{
-    if (name == nullptr)
-    {
-        return std::string();
-    }
-
-    std::string result    = name;
-
-    // Replace prefix if it matches
-    size_t old_prefix_len = strlen(old_prefix);
-    if (result.compare(0, old_prefix_len, old_prefix) == 0)
-    {
-        result = std::string(new_prefix) + result.substr(old_prefix_len);
-    }
-
-    // Replace spaces with underscores
-    for (char& c : result)
-    {
-        if (c == ' ')
-        {
-            c = '_';
-        }
-    }
-
-    return result;
 }
 
 // =========================================================================================================================================
@@ -232,61 +198,219 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
 
     // ===============================================================================================
     // ===============================================================================================
-    // populate data_t
     // ===============================================================================================
     // ===============================================================================================
     data_t data;
+
+    // ===============================================================================================
+    // ===============================================================================================
+    // materials
+    // ===============================================================================================
+    // ===============================================================================================
     {
-        // scenes
+        LISTBASE_FOREACH(Material*, mat, &bmain->materials)
+        {
+            if (mat->nodetree == nullptr) continue;
+
+            material_t material_data;
+            material_data.name = mat->id.name;
+
+            // Iterate through all nodes in the shader graph
+            LISTBASE_FOREACH(bNode*, node, &mat->nodetree->nodes)
+            {
+                shader_node_t node_data;
+                node_data.idname = node->idname;
+
+                // Input sockets
+                LISTBASE_FOREACH(bNodeSocket*, socket, &node->inputs)
+                {
+                    shader_node_socket_t socket_data;
+                    socket_data.identifier = socket->identifier;
+                    socket_data.idname     = socket->idname;
+                    node_data.inputs.push_back(socket_data);
+                }
+
+                // Output sockets
+                LISTBASE_FOREACH(bNodeSocket*, socket, &node->outputs)
+                {
+                    shader_node_socket_t socket_data;
+                    socket_data.identifier = socket->identifier;
+                    socket_data.idname     = socket->idname;
+                    node_data.outputs.push_back(socket_data);
+                }
+
+                material_data.nodes.push_back(node_data);
+            }
+
+            // Iterate through all links in the shader graph
+            LISTBASE_FOREACH(bNodeLink*, link, &mat->nodetree->links)
+            {
+                if (link->fromnode && link->tonode && link->fromsock && link->tosock)
+                {
+                    shader_link_t link_data;
+                    link_data.from_node   = link->fromnode->name;
+                    link_data.from_socket = link->fromsock->identifier;
+                    link_data.to_node     = link->tonode->name;
+                    link_data.to_socket   = link->tosock->identifier;
+                    material_data.links.push_back(link_data);
+                }
+            }
+
+            data.materials[material_data.name] = std::move(material_data);
+        }
+    }
+
+    // ===============================================================================================
+    // ===============================================================================================
+    // meshes
+    // ===============================================================================================
+    // ===============================================================================================
+    {
+        LISTBASE_FOREACH(Mesh*, mesh, &bmain->meshes)
+        {
+            // Check for invalid material slots
+            {
+                if (mesh->totcol <= 0 || mesh->mat == nullptr)
+                {
+                    continue;
+                }
+
+                bool has_invalid_material = false;
+                for (int i = 0; i < mesh->totcol; i++)
+                {
+                    if (mesh->mat[i] == nullptr)
+                    {
+                        fprintf(log_file, "[zachary] Skipping mesh %s (has empty material slot)\n", mesh->id.name);
+                        has_invalid_material = true;
+                        break;
+                    }
+                    std::string mat_name = mesh->mat[i]->id.name;
+                    if (data.materials.find(mat_name) == data.materials.end())
+                    {
+                        fprintf(log_file, "[zachary] Skipping mesh %s (material %s not in map)\n", mesh->id.name, mat_name.c_str());
+                        has_invalid_material = true;
+                        break;
+                    }
+                }
+
+                if (has_invalid_material)
+                {
+                    continue;
+                }
+            }
+
+            blender::Span<blender::float3> positions                = mesh->vert_positions();
+            blender::Span<int> corner_verts                         = mesh->corner_verts();
+            blender::Span<blender::int3> corner_tris                = mesh->corner_tris();
+            blender::Span<int> corner_tri_faces                     = mesh->corner_tri_faces();
+            blender::bke::AttributeAccessor attributes              = mesh->attributes();
+            blender::VectorSet<blender::StringRefNull> uv_map_names = mesh->uv_map_names();
+            blender::VArraySpan<blender::float2> uv_map0;
+            blender::VArraySpan<blender::float2> uv_map1;
+            blender::VArraySpan<blender::float2> uv_map2;
+            if (uv_map_names.size() > 0) uv_map0 = *attributes.lookup<blender::float2>(uv_map_names[0], blender::bke::AttrDomain::Corner);
+            if (uv_map_names.size() > 1) uv_map1 = *attributes.lookup<blender::float2>(uv_map_names[1], blender::bke::AttrDomain::Corner);
+            if (uv_map_names.size() > 2) uv_map2 = *attributes.lookup<blender::float2>(uv_map_names[2], blender::bke::AttrDomain::Corner);
+
+            mesh_t mesh_data;
+            mesh_data.name = mesh->id.name;
+
+            // Group triangles by material index
+            std::map<int, std::vector<int>> triangles_by_material;
+            {
+                const blender::VArray<int> material_indices_varray = *attributes.lookup_or_default<int>("material_index", blender::bke::AttrDomain::Face, 0);
+                blender::VArraySpan<int> material_indices(material_indices_varray);
+
+                for (int tri_idx = 0; tri_idx < corner_tris.size(); tri_idx++)
+                {
+                    int face_idx = corner_tri_faces[tri_idx];
+                    int mat_idx  = material_indices[face_idx];
+                    triangles_by_material[mat_idx].push_back(tri_idx);
+                }
+            }
+
+            // Check for invalid material indices and skip entire mesh if found
+            bool has_invalid_mat_idx = false;
+            for (const auto& [mat_idx, _] : triangles_by_material)
+            {
+                if (mat_idx < 0 || mat_idx >= mesh->totcol || !mesh->mat[mat_idx])
+                {
+                    fprintf(log_file, "[zachary] Skipping mesh %s (face references invalid material index %d)\n", mesh->id.name, mat_idx);
+                    has_invalid_mat_idx = true;
+                    break;
+                }
+            }
+            if (has_invalid_mat_idx)
+            {
+                continue;
+            }
+
+            // Create submeshes from grouped triangles
+            for (const auto& [mat_idx, triangle_indices] : triangles_by_material)
+            {
+                submesh_t submesh;
+
+                submesh.material_name = mesh->mat[mat_idx]->id.name;
+
+                for (int tri_idx : triangle_indices)
+                {
+                    blender::int3 tri = corner_tris[tri_idx];
+                    triangle_t triangle;
+                    for (int i = 0; i < 3; i++)
+                    {
+                        int corner                      = tri[i];
+                        int vert_idx                    = corner_verts[corner];
+
+                        // Position
+                        triangle.vertices[i].position.x = positions[vert_idx].x;
+                        triangle.vertices[i].position.y = positions[vert_idx].y;
+                        triangle.vertices[i].position.z = positions[vert_idx].z;
+
+                        // UV
+                        if (!uv_map0.is_empty() && corner < uv_map0.size())
+                        {
+                            triangle.vertices[i].uv0.x = uv_map0[corner].x;
+                            triangle.vertices[i].uv0.y = uv_map0[corner].y;
+                        }
+                        if (!uv_map1.is_empty() && corner < uv_map1.size())
+                        {
+                            triangle.vertices[i].uv1.x = uv_map1[corner].x;
+                            triangle.vertices[i].uv1.y = uv_map1[corner].y;
+                        }
+                        if (!uv_map2.is_empty() && corner < uv_map2.size())
+                        {
+                            triangle.vertices[i].uv2.x = uv_map2[corner].x;
+                            triangle.vertices[i].uv2.y = uv_map2[corner].y;
+                        }
+                    }
+                    submesh.triangles.push_back(triangle);
+                }
+                mesh_data.submeshes.push_back(submesh);
+            }
+
+            data.meshes[mesh_data.name] = std::move(mesh_data);
+        }
+    }
+
+    // ===============================================================================================
+    // ===============================================================================================
+    // scenes
+    // ===============================================================================================
+    // ===============================================================================================
+    {
         LISTBASE_FOREACH(Scene*, scene, &bmain->scenes)
         {
             scene_t scene_data;
-            scene_data.name = replace_prefix(scene->id.name, "SC", "scene_");
+            scene_data.name = scene->id.name;
 
             FOREACH_SCENE_OBJECT_BEGIN(scene, ob)
             {
                 if (ob->type != OB_MESH || ob->data == nullptr) continue;
 
-                // Extract mesh geometry data
-                Mesh* mesh                                              = (Mesh*)ob->data;
-                blender::Span<blender::float3> positions                = mesh->vert_positions();
-                blender::Span<int> corner_verts                         = mesh->corner_verts();
-                blender::Span<blender::int3> corner_tris                = mesh->corner_tris();
-                blender::Span<int> corner_tri_faces                     = mesh->corner_tri_faces();
-                blender::bke::AttributeAccessor attributes              = mesh->attributes();
-                blender::VectorSet<blender::StringRefNull> uv_map_names = mesh->uv_map_names();
-                blender::Span<MDeformVert> deform_verts                 = mesh->deform_verts();
-                bool has_joint_data                                     = !deform_verts.is_empty() && mesh->corners_num > 0;
+                Mesh* mesh            = (Mesh*)ob->data;
+                std::string mesh_name = mesh->id.name;
 
-                // Cache UV maps
-                blender::VArraySpan<blender::float2> uv_map0;
-                blender::VArraySpan<blender::float2> uv_map1;
-                blender::VArraySpan<blender::float2> uv_map2;
-                if (uv_map_names.size() > 0) uv_map0 = *attributes.lookup<blender::float2>(uv_map_names[0], blender::bke::AttrDomain::Corner);
-                if (uv_map_names.size() > 1) uv_map1 = *attributes.lookup<blender::float2>(uv_map_names[1], blender::bke::AttrDomain::Corner);
-                if (uv_map_names.size() > 2) uv_map2 = *attributes.lookup<blender::float2>(uv_map_names[2], blender::bke::AttrDomain::Corner);
-
-                // Check for empty material slots
-                {
-                    bool has_empty_material_slot = false;
-                    if (mesh->totcol > 0 && mesh->mat != nullptr)
-                    {
-                        for (int i = 0; i < mesh->totcol; i++)
-                        {
-                            if (mesh->mat[i] == nullptr)
-                            {
-                                has_empty_material_slot = true;
-                                break;
-                            }
-                        }
-                    }
-                    if (has_empty_material_slot)
-                    {
-                        fprintf(log_file, "[zachary] Skipping mesh %s (has empty material slot)\n", mesh->id.name);
-                        data.invalid_mesh_names.push_back(mesh->id.name);
-                        continue;
-                    }
-                }
+                if (data.meshes.find(mesh_name) == data.meshes.end()) continue;
 
                 scene_elem_t elem = {};
                 elem.pos.x        = ob->loc[0];
@@ -298,87 +422,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 elem.scale.x      = ob->scale[0];
                 elem.scale.y      = ob->scale[1];
                 elem.scale.z      = ob->scale[2];
-
-                elem.mesh.name    = replace_prefix(mesh->id.name, "ME", "mesh_");
-
-                // Group triangles by material index
-                std::map<int, std::vector<int>> triangles_by_material;
-                {
-                    const blender::VArray<int> material_indices_varray = *attributes.lookup_or_default<int>("material_index", blender::bke::AttrDomain::Face, 0);
-                    blender::VArraySpan<int> material_indices(material_indices_varray);
-
-                    for (int tri_idx = 0; tri_idx < corner_tris.size(); tri_idx++)
-                    {
-                        int face_idx = corner_tri_faces[tri_idx];
-                        int mat_idx  = material_indices[face_idx];
-                        triangles_by_material[mat_idx].push_back(tri_idx);
-                    }
-                }
-
-                // Create submeshes from grouped triangles
-                for (const auto& [mat_idx, triangle_indices] : triangles_by_material)
-                {
-                    submesh_t submesh;
-
-                    Material* mat = BKE_object_material_get(ob, mat_idx + 1);
-                    if (mat != nullptr)
-                    {
-                        submesh.material_name = replace_prefix(mat->id.name, "MA", "mat_shad_");
-                    }
-
-                    for (int tri_idx : triangle_indices)
-                    {
-                        blender::int3 tri = corner_tris[tri_idx];
-                        triangle_t triangle;
-                        for (int i = 0; i < 3; i++)
-                        {
-                            int corner                      = tri[i];
-                            int vert_idx                    = corner_verts[corner];
-
-                            // Position
-                            triangle.vertices[i].position.x = positions[vert_idx].x;
-                            triangle.vertices[i].position.y = positions[vert_idx].y;
-                            triangle.vertices[i].position.z = positions[vert_idx].z;
-
-                            // UV
-                            if (!uv_map0.is_empty() && corner < uv_map0.size())
-                            {
-                                triangle.vertices[i].uv0.x = uv_map0[corner].x;
-                                triangle.vertices[i].uv0.y = uv_map0[corner].y;
-                            }
-                            if (!uv_map1.is_empty() && corner < uv_map1.size())
-                            {
-                                triangle.vertices[i].uv1.x = uv_map1[corner].x;
-                                triangle.vertices[i].uv1.y = uv_map1[corner].y;
-                            }
-                            if (!uv_map2.is_empty() && corner < uv_map2.size())
-                            {
-                                triangle.vertices[i].uv2.x = uv_map2[corner].x;
-                                triangle.vertices[i].uv2.y = uv_map2[corner].y;
-                            }
-
-                            // Joint data
-                            triangle.vertices[i].joint_indices.fill(0);
-                            triangle.vertices[i].joint_weights.fill(0.0f);
-                            if (has_joint_data && vert_idx < deform_verts.size())
-                            {
-                                const MDeformVert& dvert = deform_verts[vert_idx];
-                                int joint_count          = 0;
-                                for (int j = 0; j < dvert.totweight && joint_count < 4; j++)
-                                {
-                                    if (dvert.dw[j].weight > 0.0f)
-                                    {
-                                        triangle.vertices[i].joint_indices[joint_count] = (uint8_t)dvert.dw[j].def_nr;
-                                        triangle.vertices[i].joint_weights[joint_count] = dvert.dw[j].weight;
-                                        joint_count++;
-                                    }
-                                }
-                            }
-                        }
-                        submesh.triangles.push_back(triangle);
-                    }
-                    elem.mesh.submeshes.push_back(submesh);
-                }
+                elem.mesh_name    = mesh_name;
 
                 scene_data.elems.push_back(elem);
             }
@@ -386,8 +430,14 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
 
             data.scenes.push_back(scene_data);
         }
+    }
 
-        // images
+    // ===============================================================================================
+    // ===============================================================================================
+    // images
+    // ===============================================================================================
+    // ===============================================================================================
+    {
         LISTBASE_FOREACH(Image*, ima, &bmain->images)
         {
             if (!BKE_image_has_packedfile(ima))
@@ -431,7 +481,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 size_t data_size   = pixel_count * 4;
 
                 image_t image      = {};
-                image.name         = replace_prefix(ima->id.name, "IM", "img_");
+                image.name         = ima->id.name;
                 image.width        = ibuf->x;
                 image.height       = ibuf->y;
                 image.is_srgb      = IMB_colormanagement_space_is_srgb(ibuf->byte_buffer.colorspace);
@@ -439,60 +489,8 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 memcpy(image.rgba_data.data(), ibuf->byte_buffer.data, data_size);
 
                 IMB_freeImBuf(ibuf);
-                data.images.push_back(std::move(image));
+                data.images[image.name] = std::move(image);
             }
-        }
-
-        // materials
-        LISTBASE_FOREACH(Material*, mat, &bmain->materials)
-        {
-            if (mat->nodetree == nullptr) continue;
-
-            material_t material_data;
-            material_data.name = replace_prefix(mat->id.name, "MA", "mat_");
-
-            // Iterate through all nodes in the shader graph
-            LISTBASE_FOREACH(bNode*, node, &mat->nodetree->nodes)
-            {
-                shader_node_t node_data;
-                node_data.idname = node->idname;
-
-                // Input sockets
-                LISTBASE_FOREACH(bNodeSocket*, socket, &node->inputs)
-                {
-                    shader_node_socket_t socket_data;
-                    socket_data.identifier = socket->identifier;
-                    socket_data.idname     = socket->idname;
-                    node_data.inputs.push_back(socket_data);
-                }
-
-                // Output sockets
-                LISTBASE_FOREACH(bNodeSocket*, socket, &node->outputs)
-                {
-                    shader_node_socket_t socket_data;
-                    socket_data.identifier = socket->identifier;
-                    socket_data.idname     = socket->idname;
-                    node_data.outputs.push_back(socket_data);
-                }
-
-                material_data.nodes.push_back(node_data);
-            }
-
-            // Iterate through all links in the shader graph
-            LISTBASE_FOREACH(bNodeLink*, link, &mat->nodetree->links)
-            {
-                if (link->fromnode && link->tonode && link->fromsock && link->tosock)
-                {
-                    shader_link_t link_data;
-                    link_data.from_node   = link->fromnode->name;
-                    link_data.from_socket = link->fromsock->identifier;
-                    link_data.to_node     = link->tonode->name;
-                    link_data.to_socket   = link->tosock->identifier;
-                    material_data.links.push_back(link_data);
-                }
-            }
-
-            data.materials.push_back(material_data);
         }
     }
 
@@ -503,79 +501,8 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
     // ===============================================================================================
     {
         fprintf(log_file, "[zachary] === DATA DUMP ===\n");
-        fprintf(log_file, "[zachary] Scene count: %zu\n", data.scenes.size());
 
-        for (size_t scene_idx = 0; scene_idx < data.scenes.size(); scene_idx++)
-        {
-            const scene_t& scene = data.scenes[scene_idx];
-            fprintf(log_file, "[zachary]   Scene[%zu]: %s\n", scene_idx, scene.name.c_str());
-            fprintf(log_file, "[zachary]     Element count: %zu\n", scene.elems.size());
-
-            for (size_t elem_idx = 0; elem_idx < scene.elems.size(); elem_idx++)
-            {
-                const scene_elem_t& elem = scene.elems[elem_idx];
-                fprintf(log_file, "[zachary]       Elem[%zu]:\n", elem_idx);
-                fprintf(log_file, "[zachary]         pos: (%.4f, %.4f, %.4f)\n", elem.pos.x, elem.pos.y, elem.pos.z);
-                fprintf(log_file, "[zachary]         rot: (%.4f, %.4f, %.4f)\n", elem.euler_rot.x, elem.euler_rot.y, elem.euler_rot.z);
-                fprintf(log_file, "[zachary]         scale: (%.4f, %.4f, %.4f)\n", elem.scale.x, elem.scale.y, elem.scale.z);
-                fprintf(log_file, "[zachary]         mesh: %s\n", elem.mesh.name.c_str());
-                fprintf(log_file, "[zachary]           submesh count: %zu\n", elem.mesh.submeshes.size());
-
-                for (size_t submesh_idx = 0; submesh_idx < elem.mesh.submeshes.size(); submesh_idx++)
-                {
-                    const submesh_t& submesh = elem.mesh.submeshes[submesh_idx];
-                    fprintf(log_file, "[zachary]             Submesh[%zu]: material=%s, triangles=%zu\n", submesh_idx, submesh.material_name.c_str(), submesh.triangles.size());
-                }
-            }
-        }
-
-        fprintf(log_file, "[zachary] Image count: %zu\n", data.images.size());
-        for (size_t image_idx = 0; image_idx < data.images.size(); image_idx++)
-        {
-            const image_t& image = data.images[image_idx];
-            fprintf(log_file, "[zachary]   Image[%zu]: %s (%ux%u, srgb=%d, size=%zu)\n", image_idx, image.name.c_str(), image.width, image.height, image.is_srgb, image.rgba_data.size());
-        }
-
-        fprintf(log_file, "[zachary] Material count: %zu\n", data.materials.size());
-        for (size_t mat_idx = 0; mat_idx < data.materials.size(); mat_idx++)
-        {
-            const material_t& mat = data.materials[mat_idx];
-            fprintf(log_file, "[zachary]   Material[%zu]: %s\n", mat_idx, mat.name.c_str());
-            fprintf(log_file, "[zachary]     Node count: %zu\n", mat.nodes.size());
-            for (size_t node_idx = 0; node_idx < mat.nodes.size(); node_idx++)
-            {
-                const shader_node_t& node = mat.nodes[node_idx];
-                fprintf(log_file, "[zachary]       Node[%zu]: idname=\"%s\"\n", node_idx, node.idname.c_str());
-                fprintf(log_file, "[zachary]         Inputs (%zu):", node.inputs.size());
-                for (const auto& sock : node.inputs)
-                {
-                    fprintf(log_file, " %s (%s)", sock.identifier.c_str(), sock.idname.c_str());
-                }
-                fprintf(log_file, "\n");
-                fprintf(log_file, "[zachary]         Outputs (%zu):", node.outputs.size());
-                for (const auto& sock : node.outputs)
-                {
-                    fprintf(log_file, " %s (%s)", sock.identifier.c_str(), sock.idname.c_str());
-                }
-                fprintf(log_file, "\n");
-            }
-
-            fprintf(log_file, "[zachary]     Link count: %zu\n", mat.links.size());
-            for (size_t link_idx = 0; link_idx < mat.links.size(); link_idx++)
-            {
-                const shader_link_t& link = mat.links[link_idx];
-                fprintf(log_file, "[zachary]       Link[%zu]: %s.%s -> %s.%s\n", link_idx, link.from_node.c_str(), link.from_socket.c_str(), link.to_node.c_str(), link.to_socket.c_str());
-            }
-        }
-
-        if (!data.invalid_mesh_names.empty())
-        {
-            fprintf(log_file, "[zachary]   Invalid mesh names: %zu\n", data.invalid_mesh_names.size());
-            for (const std::string& name : data.invalid_mesh_names)
-            {
-                fprintf(log_file, "[zachary]     - %s\n", name.c_str());
-            }
-        }
+        // todo
 
         fprintf(log_file, "[zachary] === END DATA DUMP ===\n");
     }
@@ -593,27 +520,12 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
     BBArchiveMesh* meshes = nullptr;
     int mesh_count        = 0;
     {
-        // Collect unique meshes by name from data_t
-        std::map<std::string, const mesh_t*> unique_meshes;
-        for (const scene_t& scene : data.scenes)
-        {
-            for (const scene_elem_t& elem : scene.elems)
-            {
-                if (unique_meshes.find(elem.mesh.name) == unique_meshes.end())
-                {
-                    unique_meshes[elem.mesh.name] = &elem.mesh;
-                }
-            }
-        }
-
-        mesh_count   = unique_meshes.size();
-
+        mesh_count   = data.meshes.size();
         meshes       = (BBArchiveMesh*)arena_alloc_z(arena, sizeof(BBArchiveMesh) * mesh_count)->data;
 
         int mesh_idx = 0;
-        for (const auto& [mesh_name, mesh_ptr] : unique_meshes)
+        for (const auto& [mesh_name, mesh] : data.meshes)
         {
-            const mesh_t& mesh          = *mesh_ptr;
 
             int submesh_count           = mesh.submeshes.size();
             BBArchiveSubmesh* submeshes = (BBArchiveSubmesh*)arena_alloc_z(arena, sizeof(BBArchiveSubmesh) * submesh_count)->data;
@@ -628,8 +540,6 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 float* uv0_data              = (float*)arena_alloc_z(arena, sizeof(float) * 2 * total_vertices)->data;
                 float* uv1_data              = (float*)arena_alloc_z(arena, sizeof(float) * 2 * total_vertices)->data;
                 float* uv2_data              = (float*)arena_alloc_z(arena, sizeof(float) * 2 * total_vertices)->data;
-                uint8_t* joint_indices_data  = (uint8_t*)arena_alloc_z(arena, sizeof(uint8_t) * 4 * total_vertices)->data;
-                float* joint_weights_data    = (float*)arena_alloc_z(arena, sizeof(float) * 4 * total_vertices)->data;
 
                 // Fill data arrays from triangles
                 int vertex_offset            = 0;
@@ -652,13 +562,6 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                         uv2_data[vertex_offset * 2 + 0]       = vert.uv2.x;
                         uv2_data[vertex_offset * 2 + 1]       = vert.uv2.y;
 
-                        // Joint data
-                        for (int j = 0; j < 4; j++)
-                        {
-                            joint_indices_data[vertex_offset * 4 + j] = vert.joint_indices[j];
-                            joint_weights_data[vertex_offset * 4 + j] = vert.joint_weights[j];
-                        }
-
                         vertex_offset++;
                     }
                 }
@@ -670,8 +573,8 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 submesh.uv0               = uv0_data;
                 submesh.uv1               = uv1_data;
                 submesh.uv2               = uv2_data;
-                submesh.joint_indices     = joint_indices_data;
-                submesh.joint_weights     = joint_weights_data;
+                submesh.joint_indices     = nullptr;
+                submesh.joint_weights     = nullptr;
             }
 
             // Create mesh structure
@@ -704,16 +607,17 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
             for (size_t elem_idx = 0; elem_idx < scene.elems.size(); elem_idx++)
             {
                 const scene_elem_t& src_elem = scene.elems[elem_idx];
+                const mesh_t& mesh           = data.meshes.at(src_elem.mesh_name);
 
-                int mat_count                = src_elem.mesh.submeshes.size();
+                int mat_count                = mesh.submeshes.size();
                 const char** mat_names       = (const char**)arena_alloc_z(arena, sizeof(const char*) * mat_count)->data;
-                for (size_t i = 0; i < src_elem.mesh.submeshes.size(); i++)
+                for (size_t i = 0; i < mesh.submeshes.size(); i++)
                 {
-                    mat_names[i] = src_elem.mesh.submeshes[i].material_name.c_str();
+                    mat_names[i] = mesh.submeshes[i].material_name.c_str();
                 }
 
                 BBArchiveSceneElem& elem = elems[elem_idx];
-                elem.mesh_name           = src_elem.mesh.name.c_str();
+                elem.mesh_name           = src_elem.mesh_name.c_str();
                 elem.pos[0]              = src_elem.pos.x;
                 elem.pos[1]              = src_elem.pos.y;
                 elem.pos[2]              = src_elem.pos.z;
@@ -742,10 +646,9 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
     {
         bb_images.resize(data.images.size());
 
-        for (size_t image_idx = 0; image_idx < data.images.size(); image_idx++)
+        size_t image_idx = 0;
+        for (const auto& [image_name, image] : data.images)
         {
-            const image_t& image      = data.images[image_idx];
-
             BBArchiveImage& bb_image  = bb_images[image_idx];
             bb_image.image_name       = image.name.c_str();
             bb_image.width            = image.width;
@@ -756,6 +659,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
             bb_image.mip_levels       = 1;
             bb_image.blob             = image.rgba_data.data();
             bb_image.blob_size        = image.rgba_data.size();
+            image_idx++;
         }
     }
 
