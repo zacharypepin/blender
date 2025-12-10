@@ -1404,6 +1404,22 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
     // ===============================================================================================
     // ===============================================================================================
     // ===============================================================================================
+    auto normalize_string = [&](const std::string& str) -> const char*
+    {
+        std::string normalized = str;
+        for (char& c : normalized)
+        {
+            if (c == ' ') c = '_';
+        }
+        char* result = (char*)arena_alloc_z(arena, normalized.size() + 1)->data;
+        memcpy(result, normalized.c_str(), normalized.size() + 1);
+        return result;
+    };
+
+    // ===============================================================================================
+    // ===============================================================================================
+    // ===============================================================================================
+    // ===============================================================================================
     BBArchiveMesh* meshes = nullptr;
     int mesh_count        = 0;
     {
@@ -1466,7 +1482,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
 
             // Create mesh structure
             BBArchiveMesh* bb_mesh = &meshes[mesh_idx];
-            bb_mesh->mesh_name     = mesh.name.c_str();
+            bb_mesh->mesh_name     = normalize_string(mesh.name);
             bb_mesh->submesh_count = submesh_count;
             bb_mesh->submeshes     = submeshes;
 
@@ -1508,11 +1524,11 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 const char** mat_names = (const char**)arena_alloc_z(arena, sizeof(const char*) * mat_count)->data;
                 for (size_t i = 0; i < mesh.submeshes.size(); i++)
                 {
-                    mat_names[i] = mesh.submeshes[i].material_name.c_str();
+                    mat_names[i] = normalize_string("mat_" + mesh.submeshes[i].material_name); /* temp */
                 }
 
                 BBArchiveSceneElem& elem = elems[elem_idx];
-                elem.mesh_name           = src_elem.mesh_name.value().c_str();
+                elem.mesh_name           = normalize_string(src_elem.mesh_name.value());
                 elem.pos[0]              = src_elem.pos.x;
                 elem.pos[1]              = src_elem.pos.y;
                 elem.pos[2]              = src_elem.pos.z;
@@ -1528,7 +1544,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 elem_idx++;
             }
 
-            bb_scenes[scene_idx].scene_name = scene.name.c_str();
+            bb_scenes[scene_idx].scene_name = normalize_string(scene.name);
             bb_scenes[scene_idx].elem_count = mesh_elem_count;
             bb_scenes[scene_idx].elems      = elems;
         }
@@ -1547,7 +1563,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
         for (const auto& [image_name, image] : data.images)
         {
             BBArchiveImage& bb_image  = bb_images[image_idx];
-            bb_image.image_name       = image.name.c_str();
+            bb_image.image_name       = normalize_string(image.name);
             bb_image.width            = image.width;
             bb_image.height           = image.height;
             bb_image.num_channels     = 4;
@@ -2154,9 +2170,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                     else if constexpr (std::is_same_v<T, socket_value_string_t>)
                     {
                         field.value_type = BB_SHADER_VALUE_TYPE_TEX;
-                        char* str        = (char*)arena_alloc_z(arena, v.value.size() + 1)->data;
-                        memcpy(str, v.value.c_str(), v.value.size() + 1);
-                        field.str_val = str;
+                        field.str_val    = normalize_string(v.value);
                     }
                 },
                 val
@@ -2259,12 +2273,8 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 memcpy(bb_links, links.data(), sizeof(BBArchiveShaderLink) * links.size());
             }
 
-            // Allocate shader name
-            char* shader_name = (char*)arena_alloc_z(arena, mat.name.size() + 1)->data;
-            memcpy(shader_name, mat.name.c_str(), mat.name.size() + 1);
-
             BBArchiveShaderGraph shader_graph;
-            shader_graph.shader_name    = shader_name;
+            shader_graph.shader_name    = normalize_string(mat.name);
             shader_graph.node_count     = valid_nodes.size();
             shader_graph.nodes          = bb_nodes;
             shader_graph.link_count     = links.size();
