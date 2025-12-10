@@ -15,6 +15,7 @@
 #include "BLI_math_vector_types.hh"
 
 #include "DNA_armature_types.h"
+#include "DNA_colorband_types.h"
 #include "DNA_image_types.h"
 #include "DNA_material_types.h"
 #include "DNA_mesh_types.h"
@@ -131,8 +132,12 @@ namespace
     {
         float r, g, b, a;
     };
+    struct socket_value_string_t
+    {
+        std::string value;
+    };
 
-    using socket_default_value_t = std::variant<socket_value_float_t, socket_value_int_t, socket_value_bool_t, socket_value_vector_t, socket_value_rgba_t>;
+    using socket_default_value_t = std::variant<socket_value_float_t, socket_value_int_t, socket_value_bool_t, socket_value_vector_t, socket_value_rgba_t, socket_value_string_t>;
 
     struct shader_node_socket_t
     {
@@ -141,12 +146,19 @@ namespace
         std::optional<socket_default_value_t> default_value;
     };
 
+    struct shader_node_prop_t
+    {
+        std::string identifier;
+        socket_default_value_t value;
+    };
+
     struct shader_node_t
     {
         std::string name;
         std::string idname; // e.g. "ShaderNodeTexImage", "ShaderNodeBsdfPrincipled"
         std::vector<shader_node_socket_t> inputs;
         std::vector<shader_node_socket_t> outputs;
+        std::vector<shader_node_prop_t> props;
     };
 
     struct shader_link_t
@@ -432,6 +444,176 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                         socket_data.idname        = socket->idname;
                         socket_data.default_value = extract_default_value(socket);
                         node_data.outputs.push_back(socket_data);
+                    }
+
+                    // Node properties
+                    auto add_int_prop = [&](const char* id, int val)
+                    {
+                        shader_node_prop_t p;
+                        p.identifier = id;
+                        p.value      = socket_value_int_t{val};
+                        node_data.props.push_back(p);
+                    };
+                    auto add_bool_prop = [&](const char* id, bool val)
+                    {
+                        shader_node_prop_t p;
+                        p.identifier = id;
+                        p.value      = socket_value_bool_t{val};
+                        node_data.props.push_back(p);
+                    };
+                    auto add_float_prop = [&](const char* id, float val)
+                    {
+                        shader_node_prop_t p;
+                        p.identifier = id;
+                        p.value      = socket_value_float_t{val};
+                        node_data.props.push_back(p);
+                    };
+                    auto add_string_prop = [&](const char* id, const std::string& val)
+                    {
+                        shader_node_prop_t p;
+                        p.identifier = id;
+                        p.value      = socket_value_string_t{val};
+                        node_data.props.push_back(p);
+                    };
+                    auto add_rgba_prop = [&](const char* id, float r, float g, float b, float a)
+                    {
+                        shader_node_prop_t p;
+                        p.identifier = id;
+                        p.value      = socket_value_rgba_t{r, g, b, a};
+                        node_data.props.push_back(p);
+                    };
+
+                    if (strcmp(node->idname, "ShaderNodeUVMap") == 0)
+                    {
+                        NodeShaderUVMap* data = (NodeShaderUVMap*)node->storage;
+                        if (data) add_string_prop("uv_map", data->uv_map);
+                    }
+                    else if (strcmp(node->idname, "ShaderNodeMath") == 0)
+                    {
+                        add_int_prop("operation", node->custom1);
+                        add_bool_prop("use_clamp", node->custom2 != 0);
+                    }
+                    else if (strcmp(node->idname, "ShaderNodeVectorMath") == 0)
+                    {
+                        add_int_prop("operation", node->custom1);
+                    }
+                    else if (strcmp(node->idname, "ShaderNodeMix") == 0)
+                    {
+                        NodeShaderMix* data = (NodeShaderMix*)node->storage;
+                        if (data)
+                        {
+                            add_int_prop("blend_type", data->blend_type);
+                            add_bool_prop("clamp_factor", data->clamp_factor != 0);
+                            add_bool_prop("clamp_result", data->clamp_result != 0);
+                            add_int_prop("data_type", data->data_type);
+                            add_int_prop("factor_mode", data->factor_mode);
+                        }
+                    }
+                    else if (strcmp(node->idname, "ShaderNodeSeparateColor") == 0 || strcmp(node->idname, "ShaderNodeCombineColor") == 0)
+                    {
+                        NodeCombSepColor* data = (NodeCombSepColor*)node->storage;
+                        if (data) add_int_prop("mode", data->mode);
+                    }
+                    else if (strcmp(node->idname, "ShaderNodeTexNoise") == 0)
+                    {
+                        NodeTexNoise* data = (NodeTexNoise*)node->storage;
+                        if (data)
+                        {
+                            add_int_prop("noise_dimensions", data->dimensions);
+                            add_int_prop("noise_type", data->type);
+                            add_bool_prop("normalize", data->normalize != 0);
+                        }
+                    }
+                    else if (strcmp(node->idname, "ShaderNodeTexImage") == 0)
+                    {
+                        if (node->id != nullptr)
+                        {
+                            Image* ima = (Image*)node->id;
+                            add_string_prop("image", ima->id.name);
+                        }
+                        NodeTexImage* data = (NodeTexImage*)node->storage;
+                        if (data)
+                        {
+                            add_int_prop("interpolation", data->interpolation);
+                            add_int_prop("projection", data->projection);
+                            add_int_prop("extension", data->extension);
+                        }
+                    }
+                    else if (strcmp(node->idname, "ShaderNodeValToRGB") == 0)
+                    {
+                        ColorBand* coba = (ColorBand*)node->storage;
+                        if (coba)
+                        {
+                            add_int_prop("interpolation", coba->ipotype);
+                            add_int_prop("element_count", coba->tot);
+                            for (int i = 0; i < coba->tot && i < 8; i++)
+                            {
+                                add_float_prop(("position_" + std::to_string(i)).c_str(), coba->data[i].pos);
+                                add_rgba_prop(("color_" + std::to_string(i)).c_str(), coba->data[i].r, coba->data[i].g, coba->data[i].b, coba->data[i].a);
+                            }
+                        }
+                    }
+                    else if (strcmp(node->idname, "ShaderNodeAmbientOcclusion") == 0)
+                    {
+                        add_int_prop("samples", node->custom1);
+                        add_bool_prop("inside", (node->custom2 & SHD_AO_INSIDE) != 0);
+                        add_bool_prop("only_local", (node->custom2 & SHD_AO_LOCAL) != 0);
+                    }
+                    else if (strcmp(node->idname, "ShaderNodeBump") == 0)
+                    {
+                        add_bool_prop("invert", node->custom1 != 0);
+                    }
+                    else if (strcmp(node->idname, "ShaderNodeClamp") == 0)
+                    {
+                        add_int_prop("clamp_type", node->custom1);
+                    }
+                    else if (strcmp(node->idname, "ShaderNodeDisplacement") == 0)
+                    {
+                        add_int_prop("space", node->custom1);
+                    }
+                    else if (strcmp(node->idname, "ShaderNodeMapRange") == 0)
+                    {
+                        NodeMapRange* data = (NodeMapRange*)node->storage;
+                        if (data)
+                        {
+                            add_int_prop("data_type", data->data_type);
+                            add_int_prop("interpolation_type", data->interpolation_type);
+                            add_bool_prop("clamp", data->clamp != 0);
+                        }
+                    }
+                    else if (strcmp(node->idname, "ShaderNodeMapping") == 0)
+                    {
+                        add_int_prop("vector_type", node->custom1);
+                    }
+                    else if (strcmp(node->idname, "ShaderNodeNormalMap") == 0)
+                    {
+                        NodeShaderNormalMap* data = (NodeShaderNormalMap*)node->storage;
+                        if (data)
+                        {
+                            add_int_prop("space", data->space);
+                            add_string_prop("uv_map", data->uv_map);
+                        }
+                    }
+                    else if (strcmp(node->idname, "ShaderNodeTangent") == 0)
+                    {
+                        NodeShaderTangent* data = (NodeShaderTangent*)node->storage;
+                        if (data)
+                        {
+                            add_int_prop("direction_type", data->direction_type);
+                            add_int_prop("axis", data->axis);
+                            add_string_prop("uv_map", data->uv_map);
+                        }
+                    }
+                    else if (strcmp(node->idname, "ShaderNodeTexBrick") == 0)
+                    {
+                        NodeTexBrick* data = (NodeTexBrick*)node->storage;
+                        if (data)
+                        {
+                            add_float_prop("offset", data->offset);
+                            add_int_prop("offset_frequency", data->offset_freq);
+                            add_float_prop("squash", data->squash);
+                            add_int_prop("squash_frequency", data->squash_freq);
+                        }
                     }
 
                     material_data.nodes.push_back(node_data);
@@ -1092,7 +1274,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
             for (size_t i = 0; i < mat.nodes.size(); i++)
             {
                 const auto& node = mat.nodes[i];
-                fprintf(log_file, "    node[%zu]: %s [%s] (inputs=%zu, outputs=%zu)\n", i, node.name.c_str(), node.idname.c_str(), node.inputs.size(), node.outputs.size());
+                fprintf(log_file, "    node[%zu]: %s [%s] (inputs=%zu, outputs=%zu, props=%zu)\n", i, node.name.c_str(), node.idname.c_str(), node.inputs.size(), node.outputs.size(), node.props.size());
                 auto format_default_value = [](const std::optional<socket_default_value_t>& val) -> std::string
                 {
                     if (!val.has_value()) return "";
@@ -1105,6 +1287,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                             else if constexpr (std::is_same_v<T, socket_value_bool_t>) return std::string(" = ") + (v.value ? "true" : "false");
                             else if constexpr (std::is_same_v<T, socket_value_vector_t>) return " = (" + std::to_string(v.x) + ", " + std::to_string(v.y) + ", " + std::to_string(v.z) + ")";
                             else if constexpr (std::is_same_v<T, socket_value_rgba_t>) return " = (" + std::to_string(v.r) + ", " + std::to_string(v.g) + ", " + std::to_string(v.b) + ", " + std::to_string(v.a) + ")";
+                            else if constexpr (std::is_same_v<T, socket_value_string_t>) return " = \"" + v.value + "\"";
                             else return "";
                         },
                         val.value()
@@ -1117,6 +1300,24 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 for (const auto& output : node.outputs)
                 {
                     fprintf(log_file, "      out: %s (%s)%s\n", output.identifier.c_str(), output.idname.c_str(), format_default_value(output.default_value).c_str());
+                }
+                for (const auto& prop : node.props)
+                {
+                    std::string value_str = std::visit(
+                        [](auto&& v) -> std::string
+                        {
+                            using T = std::decay_t<decltype(v)>;
+                            if constexpr (std::is_same_v<T, socket_value_float_t>) return std::to_string(v.value);
+                            else if constexpr (std::is_same_v<T, socket_value_int_t>) return std::to_string(v.value);
+                            else if constexpr (std::is_same_v<T, socket_value_bool_t>) return v.value ? "true" : "false";
+                            else if constexpr (std::is_same_v<T, socket_value_vector_t>) return "(" + std::to_string(v.x) + ", " + std::to_string(v.y) + ", " + std::to_string(v.z) + ")";
+                            else if constexpr (std::is_same_v<T, socket_value_rgba_t>) return "(" + std::to_string(v.r) + ", " + std::to_string(v.g) + ", " + std::to_string(v.b) + ", " + std::to_string(v.a) + ")";
+                            else if constexpr (std::is_same_v<T, socket_value_string_t>) return "\"" + v.value + "\"";
+                            else return "";
+                        },
+                        prop.value
+                    );
+                    fprintf(log_file, "      prop: %s = %s\n", prop.identifier.c_str(), value_str.c_str());
                 }
             }
             for (const auto& link : mat.links)
