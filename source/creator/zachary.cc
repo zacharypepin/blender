@@ -1,5 +1,6 @@
 #include "zachary.h"
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -8,6 +9,7 @@
 #include <map>
 #include <optional>
 #include <queue>
+#include <regex>
 #include <set>
 #include <unordered_map>
 #include <variant>
@@ -16,11 +18,16 @@
 #include "BLI_listbase.h"
 #include "BLI_math_vector_types.hh"
 
+#include "DNA_action_types.h"
+#include "DNA_anim_types.h"
 #include "DNA_armature_types.h"
 #include "DNA_colorband_types.h"
+#include "DNA_curve_types.h"
 #include "DNA_image_types.h"
 #include "DNA_material_types.h"
 #include "DNA_mesh_types.h"
+#include "DNA_meshdata_types.h"
+#include "DNA_nla_types.h"
 #include "DNA_node_types.h"
 #include "DNA_object_types.h"
 #include "DNA_packedFile_types.h"
@@ -68,6 +75,8 @@ namespace
         vec2_t uv0;
         vec2_t uv1;
         vec2_t uv2;
+        std::array<uint8_t, 4> joint_indices = {0, 0, 0, 0};
+        std::array<float, 4> joint_weights   = {0.0f, 0.0f, 0.0f, 0.0f};
     };
 
     struct triangle_t
@@ -181,12 +190,44 @@ namespace
         std::vector<shader_link_t> links;
     };
 
+    struct bone_t
+    {
+        std::string name;
+        int parent_index;                          // -1 for root
+        std::array<float, 16> bind_local_matrix;   // row-major 4x4
+        std::array<float, 16> inverse_bind_matrix; // row-major 4x4
+    };
+
+    struct skeleton_t
+    {
+        std::string name;
+        std::vector<bone_t> bones;
+    };
+
+    struct anim_channel_t
+    {
+        uint32_t bone_index;
+        uint32_t channel_type;       // 0=location, 1=rotation_quaternion, 2=scale
+        uint32_t interpolation_type; // 2=linear (default)
+        std::vector<float> keyframe_times;
+        std::vector<std::array<float, 4>> keyframe_values; // vec4 for all types (quat for rotation)
+    };
+
+    struct animation_t
+    {
+        std::string name;
+        std::string armature_name;
+        std::vector<anim_channel_t> channels;
+    };
+
     struct data_t
     {
         std::vector<scene_t> scenes;
         std::unordered_map<std::string, mesh_t> meshes;
         std::unordered_map<std::string, image_t> images;
         std::unordered_map<std::string, material_t> materials;
+        std::unordered_map<std::string, skeleton_t> skeletons;
+        std::vector<animation_t> animations;
     };
 }
 
@@ -1144,6 +1185,16 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
     // ===============================================================================================
     // ===============================================================================================
     {
+        auto normalize_bone_name = [](const char* name) -> std::string
+        {
+            std::string result = name;
+            for (char& c : result)
+            {
+                if (c == ' ') c = '_';
+            }
+            return result;
+        };
+
         LISTBASE_FOREACH(Mesh*, mesh, &bmain->meshes)
         {
             // Check for invalid material slots
@@ -1177,6 +1228,64 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 }
             }
 
+            // Find an object that uses this mesh to get vertex groups
+            Object* mesh_obj = nullptr;
+            LISTBASE_FOREACH(Object*, ob, &bmain->objects)
+            {
+                if (ob->type == OB_MESH && ob->data == mesh)
+                {
+                    mesh_obj = ob;
+                    break;
+                }
+            }
+
+            // Find the armature associated with this mesh (via parent)
+            bArmature* armature = nullptr;
+            std::map<std::string, int> bone_name_to_idx;
+            if (mesh_obj != nullptr)
+            {
+                // Check if parent is an armature
+                if (mesh_obj->parent != nullptr && mesh_obj->parent->type == OB_ARMATURE)
+                {
+                    armature = (bArmature*)mesh_obj->parent->data;
+                }
+
+                // Build bone name -> index map if we have an armature
+                if (armature != nullptr)
+                {
+                    int bone_idx                             = 0;
+                    std::function<void(Bone*)> collect_bones = [&](Bone* bone)
+                    {
+                        bone_name_to_idx[normalize_bone_name(bone->name)] = bone_idx++;
+                        LISTBASE_FOREACH(Bone*, child, &bone->childbase)
+                        {
+                            collect_bones(child);
+                        }
+                    };
+                    LISTBASE_FOREACH(Bone*, bone, &armature->bonebase)
+                    {
+                        collect_bones(bone);
+                    }
+                }
+            }
+
+            // Build vertex group index -> bone index map
+            std::map<int, int> vgroup_to_bone;
+            if (armature != nullptr)
+            {
+                int vgroup_idx = 0;
+                LISTBASE_FOREACH(bDeformGroup*, dg, &mesh->vertex_group_names)
+                {
+                    std::string vg_name = normalize_bone_name(dg->name);
+                    auto it             = bone_name_to_idx.find(vg_name);
+                    if (it != bone_name_to_idx.end())
+                    {
+                        vgroup_to_bone[vgroup_idx] = it->second;
+                    }
+                    vgroup_idx++;
+                }
+            }
+
             blender::Span<blender::float3> positions                = mesh->vert_positions();
             blender::Span<int> corner_verts                         = mesh->corner_verts();
             blender::Span<blender::int3> corner_tris                = mesh->corner_tris();
@@ -1189,6 +1298,10 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
             if (uv_map_names.size() > 0) uv_map0 = *attributes.lookup<blender::float2>(uv_map_names[0], blender::bke::AttrDomain::Corner);
             if (uv_map_names.size() > 1) uv_map1 = *attributes.lookup<blender::float2>(uv_map_names[1], blender::bke::AttrDomain::Corner);
             if (uv_map_names.size() > 2) uv_map2 = *attributes.lookup<blender::float2>(uv_map_names[2], blender::bke::AttrDomain::Corner);
+
+            // Get deform verts for skinning
+            blender::Span<MDeformVert> deform_verts = mesh->deform_verts();
+            bool has_skinning                       = !deform_verts.is_empty() && !vgroup_to_bone.empty();
 
             mesh_t mesh_data;
             mesh_data.name = mesh->id.name;
@@ -1259,6 +1372,46 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                         {
                             triangle.vertices[i].uv2.x = uv_map2[corner].x;
                             triangle.vertices[i].uv2.y = uv_map2[corner].y;
+                        }
+
+                        // Joint indices and weights
+                        if (has_skinning && vert_idx < deform_verts.size())
+                        {
+                            const MDeformVert& dvert = deform_verts[vert_idx];
+
+                            // Collect all bone influences for this vertex
+                            std::vector<std::pair<float, int>> influences;
+                            for (int w = 0; w < dvert.totweight; w++)
+                            {
+                                const MDeformWeight& dw = dvert.dw[w];
+                                auto it                 = vgroup_to_bone.find(dw.def_nr);
+                                if (it != vgroup_to_bone.end())
+                                {
+                                    influences.push_back({dw.weight, it->second});
+                                }
+                            }
+
+                            // Sort by weight (descending) and take top 4
+                            std::sort(influences.begin(), influences.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+
+                            // Fill in joint indices and weights (up to 4)
+                            float total_weight = 0.0f;
+                            for (size_t j = 0; j < std::min(influences.size(), (size_t)4); j++)
+                            {
+                                triangle.vertices[i].joint_indices[j]  = (uint8_t)influences[j].second;
+                                triangle.vertices[i].joint_weights[j]  = influences[j].first;
+                                total_weight                          += influences[j].first;
+                            }
+
+                            // Normalize weights
+                            if (total_weight > 0.0f)
+                            {
+                                float inv_total = 1.0f / total_weight;
+                                for (int j = 0; j < 4; j++)
+                                {
+                                    triangle.vertices[i].joint_weights[j] *= inv_total;
+                                }
+                            }
                         }
                     }
                     submesh.triangles.push_back(triangle);
@@ -1404,6 +1557,468 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
 
     // ===============================================================================================
     // ===============================================================================================
+    // skeletons
+    // ===============================================================================================
+    // ===============================================================================================
+    {
+        auto normalize_bone_name = [](const char* name) -> std::string
+        {
+            std::string result = name;
+            for (char& c : result)
+            {
+                if (c == ' ') c = '_';
+            }
+            return result;
+        };
+
+        LISTBASE_FOREACH(bArmature*, arm, &bmain->armatures)
+        {
+            skeleton_t skel;
+            skel.name = arm->id.name;
+
+            // Build bone index map and collect bones in order
+            std::map<std::string, int> bone_name_to_index;
+            std::vector<Bone*> bone_list;
+            std::vector<std::array<float, 16>> inv_mats;
+
+            // Recursive function to traverse bone hierarchy
+            std::function<void(Bone*)> collect_bones = [&](Bone* bone)
+            {
+                int idx                                             = (int)bone_list.size();
+                bone_name_to_index[normalize_bone_name(bone->name)] = idx;
+                bone_list.push_back(bone);
+
+                LISTBASE_FOREACH(Bone*, child, &bone->childbase)
+                {
+                    collect_bones(child);
+                }
+            };
+
+            // Start from root bones
+            LISTBASE_FOREACH(Bone*, bone, &arm->bonebase)
+            {
+                collect_bones(bone);
+            }
+
+            // Now process each bone
+            for (size_t i = 0; i < bone_list.size(); i++)
+            {
+                Bone* bone = bone_list[i];
+                bone_t bone_data;
+                bone_data.name = normalize_bone_name(bone->name);
+
+                // Parent index
+                if (bone->parent)
+                {
+                    auto it                = bone_name_to_index.find(normalize_bone_name(bone->parent->name));
+                    bone_data.parent_index = (it != bone_name_to_index.end()) ? it->second : -1;
+                }
+                else
+                {
+                    bone_data.parent_index = -1;
+                }
+
+                // matrix_local is the bone's rest pose transform in armature space (4x4)
+                // We need:
+                // - inverse_bind_matrix: inverse of matrix_local
+                // - bind_local_matrix: local transform relative to parent
+
+                // Compute inverse bind matrix (inverse of matrix_local)
+                // matrix_local is column-major in Blender, we store row-major
+                float inv_mat[4][4];
+                {
+                    // Copy matrix_local
+                    float mat[4][4];
+                    for (int r = 0; r < 4; r++)
+                        for (int c = 0; c < 4; c++) mat[r][c] = bone->arm_mat[c][r]; // Transpose to row-major
+
+                    // Invert 4x4 matrix (simple implementation)
+                    // For a proper implementation, use the adjugate method
+                    // But for bone matrices (rigid transforms), we can use simpler approach
+                    float det;
+                    float m[16], inv[16];
+                    for (int r = 0; r < 4; r++)
+                        for (int c = 0; c < 4; c++) m[r * 4 + c] = mat[r][c];
+
+                    inv[0]  = m[5] * m[10] * m[15] - m[5] * m[11] * m[14] - m[9] * m[6] * m[15] + m[9] * m[7] * m[14] + m[13] * m[6] * m[11] - m[13] * m[7] * m[10];
+                    inv[4]  = -m[4] * m[10] * m[15] + m[4] * m[11] * m[14] + m[8] * m[6] * m[15] - m[8] * m[7] * m[14] - m[12] * m[6] * m[11] + m[12] * m[7] * m[10];
+                    inv[8]  = m[4] * m[9] * m[15] - m[4] * m[11] * m[13] - m[8] * m[5] * m[15] + m[8] * m[7] * m[13] + m[12] * m[5] * m[11] - m[12] * m[7] * m[9];
+                    inv[12] = -m[4] * m[9] * m[14] + m[4] * m[10] * m[13] + m[8] * m[5] * m[14] - m[8] * m[6] * m[13] - m[12] * m[5] * m[10] + m[12] * m[6] * m[9];
+                    inv[1]  = -m[1] * m[10] * m[15] + m[1] * m[11] * m[14] + m[9] * m[2] * m[15] - m[9] * m[3] * m[14] - m[13] * m[2] * m[11] + m[13] * m[3] * m[10];
+                    inv[5]  = m[0] * m[10] * m[15] - m[0] * m[11] * m[14] - m[8] * m[2] * m[15] + m[8] * m[3] * m[14] + m[12] * m[2] * m[11] - m[12] * m[3] * m[10];
+                    inv[9]  = -m[0] * m[9] * m[15] + m[0] * m[11] * m[13] + m[8] * m[1] * m[15] - m[8] * m[3] * m[13] - m[12] * m[1] * m[11] + m[12] * m[3] * m[9];
+                    inv[13] = m[0] * m[9] * m[14] - m[0] * m[10] * m[13] - m[8] * m[1] * m[14] + m[8] * m[2] * m[13] + m[12] * m[1] * m[10] - m[12] * m[2] * m[9];
+                    inv[2]  = m[1] * m[6] * m[15] - m[1] * m[7] * m[14] - m[5] * m[2] * m[15] + m[5] * m[3] * m[14] + m[13] * m[2] * m[7] - m[13] * m[3] * m[6];
+                    inv[6]  = -m[0] * m[6] * m[15] + m[0] * m[7] * m[14] + m[4] * m[2] * m[15] - m[4] * m[3] * m[14] - m[12] * m[2] * m[7] + m[12] * m[3] * m[6];
+                    inv[10] = m[0] * m[5] * m[15] - m[0] * m[7] * m[13] - m[4] * m[1] * m[15] + m[4] * m[3] * m[13] + m[12] * m[1] * m[7] - m[12] * m[3] * m[5];
+                    inv[14] = -m[0] * m[5] * m[14] + m[0] * m[6] * m[13] + m[4] * m[1] * m[14] - m[4] * m[2] * m[13] - m[12] * m[1] * m[6] + m[12] * m[2] * m[5];
+                    inv[3]  = -m[1] * m[6] * m[11] + m[1] * m[7] * m[10] + m[5] * m[2] * m[11] - m[5] * m[3] * m[10] - m[9] * m[2] * m[7] + m[9] * m[3] * m[6];
+                    inv[7]  = m[0] * m[6] * m[11] - m[0] * m[7] * m[10] - m[4] * m[2] * m[11] + m[4] * m[3] * m[10] + m[8] * m[2] * m[7] - m[8] * m[3] * m[6];
+                    inv[11] = -m[0] * m[5] * m[11] + m[0] * m[7] * m[9] + m[4] * m[1] * m[11] - m[4] * m[3] * m[9] - m[8] * m[1] * m[7] + m[8] * m[3] * m[5];
+                    inv[15] = m[0] * m[5] * m[10] - m[0] * m[6] * m[9] - m[4] * m[1] * m[10] + m[4] * m[2] * m[9] + m[8] * m[1] * m[6] - m[8] * m[2] * m[5];
+
+                    det     = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12];
+                    if (std::abs(det) > 1e-10f)
+                    {
+                        det = 1.0f / det;
+                        for (int j = 0; j < 16; j++) inv[j] *= det;
+                    }
+
+                    for (int r = 0; r < 4; r++)
+                        for (int c = 0; c < 4; c++) inv_mat[r][c] = inv[r * 4 + c];
+                }
+
+                // Store for later computation of bind_local (keep in column-vector format for internal use)
+                std::array<float, 16> inv_arr;
+                for (int r = 0; r < 4; r++)
+                    for (int c = 0; c < 4; c++) inv_arr[r * 4 + c] = inv_mat[r][c];
+                inv_mats.push_back(inv_arr);
+
+                // Store inverse bind matrix (row-major, row-vector convention: translation in row 3)
+                // Transpose here to convert from column-vector to row-vector convention
+                for (int r = 0; r < 4; r++)
+                    for (int c = 0; c < 4; c++) bone_data.inverse_bind_matrix[r * 4 + c] = inv_mat[c][r];
+
+                // Compute bind_local_matrix: local transform relative to parent
+                // bind_local = parent_inverse @ bone_matrix_local
+                // For root bones, bind_local = bone_matrix_local
+                if (bone_data.parent_index == -1)
+                {
+                    // Root bone: bind_local = matrix_local
+                    // Copy directly from Blender's column-major storage (arm_mat[col][row])
+                    // This gives us row-vector convention (translation in row 3)
+                    for (int r = 0; r < 4; r++)
+                        for (int c = 0; c < 4; c++) bone_data.bind_local_matrix[r * 4 + c] = bone->arm_mat[r][c];
+                }
+                else
+                {
+                    // bind_local = parent_inv_mat @ matrix_local
+                    const auto& parent_inv = inv_mats[bone_data.parent_index];
+                    float result[4][4]     = {};
+                    for (int r = 0; r < 4; r++)
+                    {
+                        for (int c = 0; c < 4; c++)
+                        {
+                            for (int k = 0; k < 4; k++)
+                            {
+                                result[r][c] += parent_inv[r * 4 + k] * bone->arm_mat[c][k];
+                            }
+                        }
+                    }
+                    // Transpose when storing to convert to row-vector convention
+                    for (int r = 0; r < 4; r++)
+                        for (int c = 0; c < 4; c++) bone_data.bind_local_matrix[r * 4 + c] = result[c][r];
+                }
+
+                skel.bones.push_back(bone_data);
+            }
+
+            data.skeletons[skel.name] = std::move(skel);
+            fprintf(log_file, "[zachary] Processed skeleton: %s (%zu bones)\n", arm->id.name, bone_list.size());
+        }
+    }
+
+    // ===============================================================================================
+    // ===============================================================================================
+    // animations
+    // ===============================================================================================
+    // ===============================================================================================
+    {
+        auto normalize_bone_name = [](const char* name) -> std::string
+        {
+            std::string result = name;
+            for (char& c : result)
+            {
+                if (c == ' ') c = '_';
+            }
+            return result;
+        };
+
+        // Euler to quaternion conversion
+        auto euler_to_quat = [](float x, float y, float z) -> std::array<float, 4>
+        {
+            // XYZ Euler to quaternion
+            float cx = std::cos(x * 0.5f);
+            float sx = std::sin(x * 0.5f);
+            float cy = std::cos(y * 0.5f);
+            float sy = std::sin(y * 0.5f);
+            float cz = std::cos(z * 0.5f);
+            float sz = std::sin(z * 0.5f);
+
+            return {
+                sx * cy * cz - cx * sy * sz, // x
+                cx * sy * cz + sx * cy * sz, // y
+                cx * cy * sz - sx * sy * cz, // z
+                cx * cy * cz + sx * sy * sz  // w
+            };
+        };
+
+        // Helper lambda to process FCurves from an action into animation channels
+        auto process_action_fcurves = [&](bAction* action, bArmature* arm, const std::map<std::string, int>& bone_name_to_index, const std::function<std::array<float, 4>(float, float, float)>& euler_to_quat_fn) -> std::optional<animation_t>
+        {
+            // Collect all FCurves from this action (using the new layered system)
+            std::vector<FCurve*> all_fcurves;
+
+            // New layered animation system: layer_array -> strip_array -> strip_keyframe_data_array -> channelbag_array -> fcurve_array
+            for (int layer_idx = 0; layer_idx < action->layer_array_num; layer_idx++)
+            {
+                ActionLayer* layer = action->layer_array[layer_idx];
+                if (layer == nullptr) continue;
+
+                for (int strip_idx = 0; strip_idx < layer->strip_array_num; strip_idx++)
+                {
+                    ActionStrip* strip = layer->strip_array[strip_idx];
+                    if (strip == nullptr) continue;
+
+                    // Only process keyframe strips (strip_type == 1 typically, but check data_index validity)
+                    if (strip->data_index < 0 || strip->data_index >= action->strip_keyframe_data_array_num)
+                    {
+                        continue;
+                    }
+
+                    ActionStripKeyframeData* strip_data = action->strip_keyframe_data_array[strip->data_index];
+                    if (strip_data == nullptr) continue;
+
+                    for (int bag_idx = 0; bag_idx < strip_data->channelbag_array_num; bag_idx++)
+                    {
+                        ActionChannelbag* channelbag = strip_data->channelbag_array[bag_idx];
+                        if (channelbag == nullptr) continue;
+
+                        for (int fc_idx = 0; fc_idx < channelbag->fcurve_array_num; fc_idx++)
+                        {
+                            FCurve* fcurve = channelbag->fcurve_array[fc_idx];
+                            if (fcurve != nullptr)
+                            {
+                                all_fcurves.push_back(fcurve);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (all_fcurves.empty())
+            {
+                return std::nullopt;
+            }
+
+            // Get final frame for normalization
+            float final_frame = 1.0f;
+            for (FCurve* fcurve : all_fcurves)
+            {
+                if (fcurve->bezt && fcurve->totvert > 0)
+                {
+                    float last_frame = fcurve->bezt[fcurve->totvert - 1].vec[1][0];
+                    if (last_frame > final_frame) final_frame = last_frame;
+                }
+            }
+
+            animation_t anim;
+            anim.name          = action->id.name;
+            anim.armature_name = arm->id.name;
+
+            // Group FCurves by data_path (bone + transform type)
+            std::map<std::string, std::map<int, FCurve*>> grouped_fcurves;
+            for (FCurve* fcurve : all_fcurves)
+            {
+                if (fcurve->rna_path == nullptr) continue;
+                grouped_fcurves[fcurve->rna_path][fcurve->array_index] = fcurve;
+            }
+
+            // Process each grouped fcurve set
+            std::regex bone_regex(R"(pose\.bones\[\"([^\"]+)\"\]\.(\w+))");
+            for (auto& [data_path, fcurve_map] : grouped_fcurves)
+            {
+                std::smatch match;
+                std::string path_str = data_path;
+                if (!std::regex_search(path_str, match, bone_regex))
+                {
+                    continue;
+                }
+
+                std::string bone_name      = normalize_bone_name(match[1].str().c_str());
+                std::string transform_type = match[2].str();
+
+                auto bone_it               = bone_name_to_index.find(bone_name);
+                if (bone_it == bone_name_to_index.end())
+                {
+                    continue;
+                }
+
+                anim_channel_t channel;
+                channel.bone_index         = bone_it->second;
+                channel.interpolation_type = 2; // Linear
+
+                bool is_euler              = false;
+                if (transform_type == "location")
+                {
+                    channel.channel_type = 0;
+                }
+                else if (transform_type == "rotation_quaternion")
+                {
+                    channel.channel_type = 1;
+                }
+                else if (transform_type == "rotation_euler")
+                {
+                    channel.channel_type = 1; // Will convert to quaternion
+                    is_euler             = true;
+                }
+                else if (transform_type == "scale")
+                {
+                    channel.channel_type = 2;
+                }
+                else
+                {
+                    continue; // Unsupported transform type
+                }
+
+                // Collect all unique keyframe times
+                std::set<float> keyframe_times_set;
+                for (auto& [arr_idx, fcurve] : fcurve_map)
+                {
+                    if (fcurve->bezt == nullptr) continue;
+                    for (unsigned int i = 0; i < fcurve->totvert; i++)
+                    {
+                        keyframe_times_set.insert(fcurve->bezt[i].vec[1][0]);
+                    }
+                }
+
+                // Build keyframes
+                for (float frame : keyframe_times_set)
+                {
+                    float normalized_time = frame / final_frame;
+                    channel.keyframe_times.push_back(normalized_time);
+
+                    // Sample each component at this frame
+                    std::array<float, 4> values = {0.0f, 0.0f, 0.0f, 0.0f};
+
+                    // For quaternions: default w=1
+                    if (channel.channel_type == 1 && !is_euler)
+                    {
+                        values[3] = 1.0f;
+                    }
+                    // For scale: default 1,1,1
+                    if (channel.channel_type == 2)
+                    {
+                        values[0] = values[1] = values[2] = 1.0f;
+                    }
+
+                    for (auto& [arr_idx, fcurve] : fcurve_map)
+                    {
+                        if (fcurve->bezt == nullptr) continue;
+
+                        // Find keyframe at this time or interpolate
+                        float value = 0.0f;
+                        bool found  = false;
+                        for (unsigned int i = 0; i < fcurve->totvert; i++)
+                        {
+                            if (std::abs(fcurve->bezt[i].vec[1][0] - frame) < 0.001f)
+                            {
+                                value = fcurve->bezt[i].vec[1][1];
+                                found = true;
+                                break;
+                            }
+                        }
+
+                        if (!found && fcurve->totvert > 0)
+                        {
+                            // Use previous keyframe value
+                            for (int i = (int)fcurve->totvert - 1; i >= 0; i--)
+                            {
+                                if (fcurve->bezt[i].vec[1][0] <= frame)
+                                {
+                                    value = fcurve->bezt[i].vec[1][1];
+                                    break;
+                                }
+                            }
+                        }
+
+                        // Map array index to output position
+                        // Blender quaternion: WXYZ, our output: XYZW
+                        if (channel.channel_type == 1 && !is_euler)
+                        {
+                            // Quaternion reordering: Blender WXYZ -> XYZW
+                            if (arr_idx == 0) values[3] = value;      // W -> index 3
+                            else if (arr_idx == 1) values[0] = value; // X -> index 0
+                            else if (arr_idx == 2) values[1] = value; // Y -> index 1
+                            else if (arr_idx == 3) values[2] = value; // Z -> index 2
+                        }
+                        else if (arr_idx < 4)
+                        {
+                            values[arr_idx] = value;
+                        }
+                    }
+
+                    // Convert Euler to quaternion if needed
+                    if (is_euler)
+                    {
+                        values = euler_to_quat_fn(values[0], values[1], values[2]);
+                    }
+
+                    channel.keyframe_values.push_back(values);
+                }
+
+                if (!channel.keyframe_times.empty())
+                {
+                    anim.channels.push_back(std::move(channel));
+                }
+            }
+
+            if (anim.channels.empty())
+            {
+                return std::nullopt;
+            }
+
+            return anim;
+        };
+
+        // Process each armature object with NLA animation data
+        LISTBASE_FOREACH(Object*, ob, &bmain->objects)
+        {
+            if (ob->type != OB_ARMATURE || ob->adt == nullptr) continue;
+
+            bArmature* arm = (bArmature*)ob->data;
+            if (arm == nullptr) continue;
+
+            // Build bone name to index map for this armature
+            std::map<std::string, int> bone_name_to_index;
+            {
+                int idx                            = 0;
+                std::function<void(Bone*)> collect = [&](Bone* bone)
+                {
+                    bone_name_to_index[normalize_bone_name(bone->name)] = idx++;
+                    LISTBASE_FOREACH(Bone*, child, &bone->childbase)
+                    {
+                        collect(child);
+                    }
+                };
+                LISTBASE_FOREACH(Bone*, bone, &arm->bonebase)
+                {
+                    collect(bone);
+                }
+            }
+
+            // Process NLA tracks
+            AnimData* adt = ob->adt;
+            LISTBASE_FOREACH(NlaTrack*, track, &adt->nla_tracks)
+            {
+                LISTBASE_FOREACH(NlaStrip*, strip, &track->strips)
+                {
+                    bAction* action = strip->act;
+                    if (action == nullptr) continue;
+
+                    auto result = process_action_fcurves(action, arm, bone_name_to_index, euler_to_quat);
+                    if (result.has_value())
+                    {
+                        data.animations.push_back(std::move(result.value()));
+                        fprintf(log_file, "[zachary] Processed animation: %s (%zu channels)\n", action->id.name, data.animations.back().channels.size());
+                    }
+                }
+            }
+        }
+    }
+
+    // ===============================================================================================
+    // ===============================================================================================
     // dump data_t to log file
     // ===============================================================================================
     // ===============================================================================================
@@ -1524,6 +2139,49 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 fprintf(log_file, "    link: %s.%s -> %s.%s\n", link.from_node.c_str(), link.from_socket.c_str(), link.to_node.c_str(), link.to_socket.c_str());
             }
         }
+        fprintf(log_file, "\n");
+
+        // Skeletons
+        fprintf(log_file, "SKELETONS (%zu):\n", data.skeletons.size());
+        for (const auto& [skel_name, skel] : data.skeletons)
+        {
+            fprintf(log_file, "  skeleton: %s (%zu bones)\n", skel.name.c_str(), skel.bones.size());
+            for (size_t i = 0; i < skel.bones.size(); i++)
+            {
+                const auto& bone = skel.bones[i];
+                fprintf(log_file, "    bone[%zu]: %s (parent=%d)\n", i, bone.name.c_str(), bone.parent_index);
+                fprintf(log_file, "      bind_local: [%.4f, %.4f, %.4f, %.4f]\n", bone.bind_local_matrix[0], bone.bind_local_matrix[1], bone.bind_local_matrix[2], bone.bind_local_matrix[3]);
+                fprintf(log_file, "                  [%.4f, %.4f, %.4f, %.4f]\n", bone.bind_local_matrix[4], bone.bind_local_matrix[5], bone.bind_local_matrix[6], bone.bind_local_matrix[7]);
+                fprintf(log_file, "                  [%.4f, %.4f, %.4f, %.4f]\n", bone.bind_local_matrix[8], bone.bind_local_matrix[9], bone.bind_local_matrix[10], bone.bind_local_matrix[11]);
+                fprintf(log_file, "                  [%.4f, %.4f, %.4f, %.4f]\n", bone.bind_local_matrix[12], bone.bind_local_matrix[13], bone.bind_local_matrix[14], bone.bind_local_matrix[15]);
+                fprintf(log_file, "      inv_bind:   [%.4f, %.4f, %.4f, %.4f]\n", bone.inverse_bind_matrix[0], bone.inverse_bind_matrix[1], bone.inverse_bind_matrix[2], bone.inverse_bind_matrix[3]);
+                fprintf(log_file, "                  [%.4f, %.4f, %.4f, %.4f]\n", bone.inverse_bind_matrix[4], bone.inverse_bind_matrix[5], bone.inverse_bind_matrix[6], bone.inverse_bind_matrix[7]);
+                fprintf(log_file, "                  [%.4f, %.4f, %.4f, %.4f]\n", bone.inverse_bind_matrix[8], bone.inverse_bind_matrix[9], bone.inverse_bind_matrix[10], bone.inverse_bind_matrix[11]);
+                fprintf(log_file, "                  [%.4f, %.4f, %.4f, %.4f]\n", bone.inverse_bind_matrix[12], bone.inverse_bind_matrix[13], bone.inverse_bind_matrix[14], bone.inverse_bind_matrix[15]);
+            }
+        }
+        fprintf(log_file, "\n");
+
+        // Animations
+        fprintf(log_file, "ANIMATIONS (%zu):\n", data.animations.size());
+        for (const auto& anim : data.animations)
+        {
+            fprintf(log_file, "  animation: %s (armature=%s, %zu channels)\n", anim.name.c_str(), anim.armature_name.c_str(), anim.channels.size());
+            for (size_t i = 0; i < anim.channels.size(); i++)
+            {
+                const auto& channel  = anim.channels[i];
+                const char* type_str = channel.channel_type == 0 ? "location" : (channel.channel_type == 1 ? "rotation" : "scale");
+                fprintf(log_file, "    channel[%zu]: bone=%u, type=%s, keyframes=%zu\n", i, channel.bone_index, type_str, channel.keyframe_times.size());
+                // Print first and last keyframe for debugging
+                if (!channel.keyframe_times.empty())
+                {
+                    const auto& first_val = channel.keyframe_values.front();
+                    const auto& last_val  = channel.keyframe_values.back();
+                    fprintf(log_file, "      first (t=%.3f): [%.4f, %.4f, %.4f, %.4f]\n", channel.keyframe_times.front(), first_val[0], first_val[1], first_val[2], first_val[3]);
+                    fprintf(log_file, "      last  (t=%.3f): [%.4f, %.4f, %.4f, %.4f]\n", channel.keyframe_times.back(), last_val[0], last_val[1], last_val[2], last_val[3]);
+                }
+            }
+        }
 
         fprintf(log_file, "\n[zachary] === END DATA DUMP ===\n");
     }
@@ -1577,6 +2235,11 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 float* uv0_data              = (float*)arena_alloc_z(arena, sizeof(float) * 2 * total_vertices)->data;
                 float* uv1_data              = (float*)arena_alloc_z(arena, sizeof(float) * 2 * total_vertices)->data;
                 float* uv2_data              = (float*)arena_alloc_z(arena, sizeof(float) * 2 * total_vertices)->data;
+                uint8_t* joint_indices_data  = (uint8_t*)arena_alloc_z(arena, sizeof(uint8_t) * 4 * total_vertices)->data;
+                float* joint_weights_data    = (float*)arena_alloc_z(arena, sizeof(float) * 4 * total_vertices)->data;
+
+                // Check if any vertex has skinning data
+                bool has_skinning            = false;
 
                 // Fill data arrays from triangles
                 int vertex_offset            = 0;
@@ -1584,20 +2247,33 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 {
                     for (int i = 0; i < 3; i++)
                     {
-                        const vertex_t& vert                  = tri.vertices[i];
+                        const vertex_t& vert                      = tri.vertices[i];
 
                         // Position
-                        positions_data[vertex_offset * 3 + 0] = vert.position.x;
-                        positions_data[vertex_offset * 3 + 1] = vert.position.y;
-                        positions_data[vertex_offset * 3 + 2] = vert.position.z;
+                        positions_data[vertex_offset * 3 + 0]     = vert.position.x;
+                        positions_data[vertex_offset * 3 + 1]     = vert.position.y;
+                        positions_data[vertex_offset * 3 + 2]     = vert.position.z;
 
                         // UV
-                        uv0_data[vertex_offset * 2 + 0]       = vert.uv0.x;
-                        uv0_data[vertex_offset * 2 + 1]       = vert.uv0.y;
-                        uv1_data[vertex_offset * 2 + 0]       = vert.uv1.x;
-                        uv1_data[vertex_offset * 2 + 1]       = vert.uv1.y;
-                        uv2_data[vertex_offset * 2 + 0]       = vert.uv2.x;
-                        uv2_data[vertex_offset * 2 + 1]       = vert.uv2.y;
+                        uv0_data[vertex_offset * 2 + 0]           = vert.uv0.x;
+                        uv0_data[vertex_offset * 2 + 1]           = vert.uv0.y;
+                        uv1_data[vertex_offset * 2 + 0]           = vert.uv1.x;
+                        uv1_data[vertex_offset * 2 + 1]           = vert.uv1.y;
+                        uv2_data[vertex_offset * 2 + 0]           = vert.uv2.x;
+                        uv2_data[vertex_offset * 2 + 1]           = vert.uv2.y;
+
+                        // Joint indices and weights
+                        joint_indices_data[vertex_offset * 4 + 0] = vert.joint_indices[0];
+                        joint_indices_data[vertex_offset * 4 + 1] = vert.joint_indices[1];
+                        joint_indices_data[vertex_offset * 4 + 2] = vert.joint_indices[2];
+                        joint_indices_data[vertex_offset * 4 + 3] = vert.joint_indices[3];
+                        joint_weights_data[vertex_offset * 4 + 0] = vert.joint_weights[0];
+                        joint_weights_data[vertex_offset * 4 + 1] = vert.joint_weights[1];
+                        joint_weights_data[vertex_offset * 4 + 2] = vert.joint_weights[2];
+                        joint_weights_data[vertex_offset * 4 + 3] = vert.joint_weights[3];
+
+                        // Check if this vertex has any non-zero weight
+                        if (vert.joint_weights[0] > 0.0f) has_skinning = true;
 
                         vertex_offset++;
                     }
@@ -1610,8 +2286,8 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 submesh.uv0               = uv0_data;
                 submesh.uv1               = uv1_data;
                 submesh.uv2               = uv2_data;
-                submesh.joint_indices     = nullptr;
-                submesh.joint_weights     = nullptr;
+                submesh.joint_indices     = has_skinning ? joint_indices_data : nullptr;
+                submesh.joint_weights     = has_skinning ? joint_weights_data : nullptr;
             }
 
             // Create mesh structure
@@ -2708,6 +3384,136 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
 
     // ===============================================================================================
     // ===============================================================================================
+    // Extract skeletons for bb_archive
+    // ===============================================================================================
+    // ===============================================================================================
+    std::vector<BBArchiveSkel> bb_skeletons;
+    {
+        bb_skeletons.reserve(data.skeletons.size());
+
+        for (const auto& [skel_name, skel] : data.skeletons)
+        {
+            size_t bone_count       = skel.bones.size();
+
+            // Allocate bone names array
+            const char** bone_names = (const char**)arena_alloc_z(arena, sizeof(const char*) * bone_count)->data;
+            for (size_t i = 0; i < bone_count; i++)
+            {
+                bone_names[i] = normalize_string(skel.bones[i].name);
+            }
+
+            // Allocate parent indices array
+            int32_t* parent_indices = (int32_t*)arena_alloc_z(arena, sizeof(int32_t) * bone_count)->data;
+            for (size_t i = 0; i < bone_count; i++)
+            {
+                parent_indices[i] = skel.bones[i].parent_index;
+            }
+
+            // Allocate bind local matrices (16 floats per bone)
+            float* bind_local_mats = (float*)arena_alloc_z(arena, sizeof(float) * 16 * bone_count)->data;
+            for (size_t i = 0; i < bone_count; i++)
+            {
+                for (int j = 0; j < 16; j++)
+                {
+                    bind_local_mats[i * 16 + j] = skel.bones[i].bind_local_matrix[j];
+                }
+            }
+
+            // Allocate inverse bind matrices (16 floats per bone)
+            float* inv_bind_mats = (float*)arena_alloc_z(arena, sizeof(float) * 16 * bone_count)->data;
+            for (size_t i = 0; i < bone_count; i++)
+            {
+                for (int j = 0; j < 16; j++)
+                {
+                    inv_bind_mats[i * 16 + j] = skel.bones[i].inverse_bind_matrix[j];
+                }
+            }
+
+            BBArchiveSkel bb_skel;
+            bb_skel.skeleton_name         = normalize_string(skel.name);
+            bb_skel.bone_count            = bone_count;
+            bb_skel.bone_names            = bone_names;
+            bb_skel.parent_bone_indices   = parent_indices;
+            bb_skel.bind_local_matrices   = bind_local_mats;
+            bb_skel.inverse_bind_matrices = inv_bind_mats;
+
+            bb_skeletons.push_back(bb_skel);
+        }
+
+        fprintf(log_file, "[zachary] Exported %zu skeletons\n", bb_skeletons.size());
+    }
+
+    // ===============================================================================================
+    // ===============================================================================================
+    // Extract animations for bb_archive
+    // ===============================================================================================
+    // ===============================================================================================
+    std::vector<BBArchiveAnim> bb_animations;
+    {
+        bb_animations.reserve(data.animations.size());
+
+        for (const auto& anim : data.animations)
+        {
+            size_t channel_count = anim.channels.size();
+            if (channel_count == 0) continue;
+
+            // Allocate per-channel arrays
+            uint32_t* bone_indices        = (uint32_t*)arena_alloc_z(arena, sizeof(uint32_t) * channel_count)->data;
+            uint32_t* channel_types       = (uint32_t*)arena_alloc_z(arena, sizeof(uint32_t) * channel_count)->data;
+            uint32_t* interpolation_types = (uint32_t*)arena_alloc_z(arena, sizeof(uint32_t) * channel_count)->data;
+            uint32_t* keyframe_counts     = (uint32_t*)arena_alloc_z(arena, sizeof(uint32_t) * channel_count)->data;
+
+            // Calculate total keyframe count
+            size_t total_keyframes        = 0;
+            for (size_t i = 0; i < channel_count; i++)
+            {
+                total_keyframes += anim.channels[i].keyframe_times.size();
+            }
+
+            // Allocate keyframe arrays
+            float* keyframe_times  = (float*)arena_alloc_z(arena, sizeof(float) * total_keyframes)->data;
+            float* keyframe_values = (float*)arena_alloc_z(arena, sizeof(float) * total_keyframes * 4)->data;
+
+            // Fill arrays
+            size_t time_offset     = 0;
+            size_t value_offset    = 0;
+            for (size_t i = 0; i < channel_count; i++)
+            {
+                const anim_channel_t& channel = anim.channels[i];
+
+                bone_indices[i]               = channel.bone_index;
+                channel_types[i]              = channel.channel_type;
+                interpolation_types[i]        = channel.interpolation_type;
+                keyframe_counts[i]            = channel.keyframe_times.size();
+
+                for (size_t k = 0; k < channel.keyframe_times.size(); k++)
+                {
+                    keyframe_times[time_offset++]   = channel.keyframe_times[k];
+                    keyframe_values[value_offset++] = channel.keyframe_values[k][0];
+                    keyframe_values[value_offset++] = channel.keyframe_values[k][1];
+                    keyframe_values[value_offset++] = channel.keyframe_values[k][2];
+                    keyframe_values[value_offset++] = channel.keyframe_values[k][3];
+                }
+            }
+
+            BBArchiveAnim bb_anim;
+            bb_anim.animation_name      = normalize_string(anim.name);
+            bb_anim.channel_count       = channel_count;
+            bb_anim.bone_indices        = bone_indices;
+            bb_anim.channel_types       = channel_types;
+            bb_anim.interpolation_types = interpolation_types;
+            bb_anim.keyframe_counts     = keyframe_counts;
+            bb_anim.keyframe_times      = keyframe_times;
+            bb_anim.keyframe_values     = keyframe_values;
+
+            bb_animations.push_back(bb_anim);
+        }
+
+        fprintf(log_file, "[zachary] Exported %zu animations\n", bb_animations.size());
+    }
+
+    // ===============================================================================================
+    // ===============================================================================================
     // Write to bb_archive
     // ===============================================================================================
     // ===============================================================================================
@@ -2715,14 +3521,14 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
         BBArchiveInfo info      = {0};
         info.mesh_count         = mesh_count;
         info.image_count        = bb_images.size();
-        info.skeleton_count     = 0;
-        info.animation_count    = 0;
+        info.skeleton_count     = bb_skeletons.size();
+        info.animation_count    = bb_animations.size();
         info.shader_graph_count = bb_shaders.size();
         info.scene_count        = bb_scenes.size();
         info.meshes             = meshes;
         info.images             = bb_images.data();
-        info.skeletons          = nullptr;
-        info.animations         = nullptr;
+        info.skeletons          = bb_skeletons.empty() ? nullptr : bb_skeletons.data();
+        info.animations         = bb_animations.empty() ? nullptr : bb_animations.data();
         info.shader_graphs      = bb_shaders.data();
         info.scenes             = bb_scenes.data();
 
