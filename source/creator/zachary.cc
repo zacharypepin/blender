@@ -627,9 +627,6 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 }
             }
 
-            material_data.nodes                                                              = std::move(filtered_nodes);
-            material_data.links                                                              = std::move(filtered_links);
-
             static const std::map<std::string, std::set<std::string>> supported_node_outputs = {
                 {       "ShaderNodeNewGeometry",                     {"Position", "Normal", "Tangent", "True Normal"}},
                 {          "ShaderNodeTexCoord",                              {"Generated", "UV", "Object", "Normal"}},
@@ -678,7 +675,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
 
             bool is_supported = true;
             {
-                for (const auto& node : material_data.nodes)
+                for (const auto& node : filtered_nodes)
                 {
                     if (supported_node_outputs.find(node.idname) == supported_node_outputs.end())
                     {
@@ -691,12 +688,12 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 if (is_supported)
                 {
                     std::map<std::string, std::string> node_name_to_idname;
-                    for (const auto& node : material_data.nodes)
+                    for (const auto& node : filtered_nodes)
                     {
                         node_name_to_idname[node.name] = node.idname;
                     }
 
-                    for (const auto& link : material_data.links)
+                    for (const auto& link : filtered_links)
                     {
                         auto node_it = node_name_to_idname.find(link.from_node);
                         if (node_it == node_name_to_idname.end()) continue;
@@ -718,6 +715,45 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
             {
                 continue;
             }
+
+            // Filter sockets to only supported ones
+            {
+                for (auto& node : filtered_nodes)
+                {
+                    // Filter node output sockets
+                    auto it = supported_node_outputs.find(node.idname);
+                    if (it != supported_node_outputs.end())
+                    {
+                        const auto& allowed_outputs = it->second;
+                        std::vector<shader_node_socket_t> new_outputs;
+                        for (auto& socket : node.outputs)
+                        {
+                            if (allowed_outputs.count(socket.identifier))
+                            {
+                                new_outputs.push_back(std::move(socket));
+                            }
+                        }
+                        node.outputs = std::move(new_outputs);
+                    }
+
+                    // Filter Principled BSDF input sockets
+                    if (node.idname == "ShaderNodeBsdfPrincipled")
+                    {
+                        std::vector<shader_node_socket_t> new_inputs;
+                        for (auto& socket : node.inputs)
+                        {
+                            if (supported_sockets.count(socket.identifier))
+                            {
+                                new_inputs.push_back(std::move(socket));
+                            }
+                        }
+                        node.inputs = std::move(new_inputs);
+                    }
+                }
+            }
+
+            material_data.nodes                = std::move(filtered_nodes);
+            material_data.links                = std::move(filtered_links);
 
             data.materials[material_data.name] = std::move(material_data);
         }
