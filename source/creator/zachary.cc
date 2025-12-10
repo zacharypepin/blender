@@ -793,12 +793,20 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 }
             }
 
-            // Filter links to only those between reachable nodes, and only supported sockets for Principled BSDF
+            // Build set of actual node names from filtered_nodes
+            std::set<std::string> filtered_node_names;
+            for (const auto& node : filtered_nodes)
+            {
+                filtered_node_names.insert(node.name);
+            }
+
+            // Filter links to only those between actual filtered nodes, and only supported sockets for Principled BSDF
             std::vector<shader_link_t> filtered_links;
             {
                 for (auto& link : material_data.links)
                 {
-                    if (!reachable_nodes.count(link.from_node) || !reachable_nodes.count(link.to_node))
+                    // Must exist in actual filtered nodes (not just reachable_nodes which is from link names)
+                    if (!filtered_node_names.count(link.from_node) || !filtered_node_names.count(link.to_node))
                     {
                         continue;
                     }
@@ -880,7 +888,12 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                     for (const auto& link : filtered_links)
                     {
                         auto node_it = node_name_to_idname.find(link.from_node);
-                        if (node_it == node_name_to_idname.end()) continue;
+                        if (node_it == node_name_to_idname.end())
+                        {
+                            // This should never happen - filtered_links should only contain links between filtered_nodes
+                            fprintf(stderr, "[zachary] BUG: Link from_node '%s' not in filtered_nodes for material %s\n", link.from_node.c_str(), mat->id.name);
+                            abort();
+                        }
 
                         const std::string& idname     = node_it->second;
                         const auto& supported_outputs = supported_node_outputs.at(idname);
