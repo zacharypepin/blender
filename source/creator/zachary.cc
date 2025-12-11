@@ -2568,8 +2568,12 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                     }
                 }
 
+                // Sort keyframe times chronologically
+                blender::Vector<float> keyframe_times(keyframe_times_set.begin(), keyframe_times_set.end());
+                std::sort(keyframe_times.begin(), keyframe_times.end());
+
                 // Build keyframes
-                for (float frame : keyframe_times_set)
+                for (float frame : keyframe_times)
                 {
                     float normalized_time = frame / final_frame;
                     channel.keyframe_times.append(normalized_time);
