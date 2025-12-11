@@ -1340,48 +1340,12 @@ static void recurs_flatten_node_tree(bNodeTree* tree, const std::string& prefix,
             }
 
             // Node properties
-            auto add_int_prop = [&](const char* id, int val)
-            {
-                shader_node_prop_t p;
-                p.identifier = id;
-                p.value      = socket_value_int_t{val};
-                node_data.props.append(p);
-            };
-            auto add_bool_prop = [&](const char* id, bool val)
-            {
-                shader_node_prop_t p;
-                p.identifier = id;
-                p.value      = socket_value_bool_t{val};
-                node_data.props.append(p);
-            };
-            auto add_float_prop = [&](const char* id, float val)
-            {
-                shader_node_prop_t p;
-                p.identifier = id;
-                p.value      = socket_value_float_t{val};
-                node_data.props.append(p);
-            };
-            auto add_tex_prop = [&](const char* id, const std::string& val)
-            {
-                shader_node_prop_t p;
-                p.identifier = id;
-                p.value      = socket_value_tex_t{val};
-                node_data.props.append(p);
-            };
-            auto add_uv_map_prop = [&](const char* id, const std::string& val)
-            {
-                shader_node_prop_t p;
-                p.identifier = id;
-                p.value      = socket_value_uv_map_t{val};
-                node_data.props.append(p);
-            };
-            auto add_rgba_prop = [&](const char* id, float r, float g, float b, float a)
-            {
-                shader_node_prop_t p;
-                p.identifier = id;
-                p.value      = socket_value_rgba_t{blender::float4(r, g, b, a)};
-                node_data.props.append(p);
-            };
+            auto add_int_prop    = [&](const char* id, int val) { node_data.props.append({id, socket_value_int_t{val}}); };
+            auto add_bool_prop   = [&](const char* id, bool val) { node_data.props.append({id, socket_value_bool_t{val}}); };
+            auto add_float_prop  = [&](const char* id, float val) { node_data.props.append({id, socket_value_float_t{val}}); };
+            auto add_tex_prop    = [&](const char* id, const std::string& val) { node_data.props.append({id, socket_value_tex_t{val}}); };
+            auto add_uv_map_prop = [&](const char* id, const std::string& val) { node_data.props.append({id, socket_value_uv_map_t{val}}); };
+            auto add_rgba_prop   = [&](const char* id, float r, float g, float b, float a) { node_data.props.append({id, socket_value_rgba_t{blender::float4(r, g, b, a)}}); };
 
             if (blender::StringRef(node->idname) == "ShaderNodeUVMap")
             {
