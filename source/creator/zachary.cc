@@ -204,11 +204,26 @@ namespace
         std::vector<bone_t> bones;
     };
 
+    enum class anim_channel_type_t
+    {
+        LOCATION = 0,
+        ROTATION = 1,
+        SCALE    = 2,
+    };
+
+    enum class anim_interpolation_type_t
+    {
+        UNSUPPORTED = 0,
+        STEP        = 1,
+        LINEAR      = 2,
+        CUBICSPLINE = 3,
+    };
+
     struct anim_channel_t
     {
         uint32_t bone_index;
-        uint32_t channel_type;       // 0=location, 1=rotation_quaternion, 2=scale
-        uint32_t interpolation_type; // 2=linear (default)
+        anim_channel_type_t channel_type;
+        anim_interpolation_type_t interpolation_type;
         std::vector<float> keyframe_times;
         std::vector<std::array<float, 4>> keyframe_values; // vec4 for all types (quat for rotation)
     };
@@ -1846,29 +1861,29 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
 
                 anim_channel_t channel;
                 channel.bone_index         = bone_it->second;
-                channel.interpolation_type = 2; // Linear
+                channel.interpolation_type = anim_interpolation_type_t::LINEAR;
 
                 bool is_euler              = false;
                 if (transform_type == "location")
                 {
-                    channel.channel_type = 0;
+                    channel.channel_type = anim_channel_type_t::LOCATION;
                 }
                 else if (transform_type == "rotation_quaternion")
                 {
-                    channel.channel_type = 1;
+                    channel.channel_type = anim_channel_type_t::ROTATION;
                 }
                 else if (transform_type == "rotation_euler")
                 {
-                    channel.channel_type = 1; // Will convert to quaternion
+                    channel.channel_type = anim_channel_type_t::ROTATION;
                     is_euler             = true;
                 }
                 else if (transform_type == "scale")
                 {
-                    channel.channel_type = 2;
+                    channel.channel_type = anim_channel_type_t::SCALE;
                 }
                 else
                 {
-                    continue; // Unsupported transform type
+                    continue;
                 }
 
                 // Collect all unique keyframe times
@@ -1892,12 +1907,12 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                     std::array<float, 4> values = {0.0f, 0.0f, 0.0f, 0.0f};
 
                     // For quaternions: default w=1
-                    if (channel.channel_type == 1 && !is_euler)
+                    if (channel.channel_type == anim_channel_type_t::ROTATION && !is_euler)
                     {
                         values[3] = 1.0f;
                     }
                     // For scale: default 1,1,1
-                    if (channel.channel_type == 2)
+                    if (channel.channel_type == anim_channel_type_t::SCALE)
                     {
                         values[0] = values[1] = values[2] = 1.0f;
                     }
@@ -1934,7 +1949,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
 
                         // Map array index to output position
                         // Blender quaternion: WXYZ, our output: XYZW
-                        if (channel.channel_type == 1 && !is_euler)
+                        if (channel.channel_type == anim_channel_type_t::ROTATION && !is_euler)
                         {
                             // Quaternion reordering: Blender WXYZ -> XYZW
                             if (arr_idx == 0) values[3] = value;      // W -> index 3
@@ -2170,7 +2185,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
             for (size_t i = 0; i < anim.channels.size(); i++)
             {
                 const auto& channel  = anim.channels[i];
-                const char* type_str = channel.channel_type == 0 ? "location" : (channel.channel_type == 1 ? "rotation" : "scale");
+                const char* type_str = channel.channel_type == anim_channel_type_t::LOCATION ? "location" : (channel.channel_type == anim_channel_type_t::ROTATION ? "rotation" : "scale");
                 fprintf(log_file, "    channel[%zu]: bone=%u, type=%s, keyframes=%zu\n", i, channel.bone_index, type_str, channel.keyframe_times.size());
                 // Print first and last keyframe for debugging
                 if (!channel.keyframe_times.empty())
@@ -3482,8 +3497,8 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 const anim_channel_t& channel = anim.channels[i];
 
                 bone_indices[i]               = channel.bone_index;
-                channel_types[i]              = channel.channel_type;
-                interpolation_types[i]        = channel.interpolation_type;
+                channel_types[i]              = static_cast<uint32_t>(channel.channel_type);
+                interpolation_types[i]        = static_cast<uint32_t>(channel.interpolation_type);
                 keyframe_counts[i]            = channel.keyframe_times.size();
 
                 for (size_t k = 0; k < channel.keyframe_times.size(); k++)
