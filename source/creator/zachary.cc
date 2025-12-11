@@ -111,7 +111,7 @@ namespace
     struct scene_t
     {
         std::string name;
-        std::map<std::string, scene_elem_t> elems;
+        blender::Map<std::string, scene_elem_t> elems;
     };
 
     struct image_t
@@ -239,10 +239,10 @@ namespace
     struct data_t
     {
         blender::Vector<scene_t> scenes;
-        std::unordered_map<std::string, mesh_t> meshes;
-        std::unordered_map<std::string, image_t> images;
-        std::unordered_map<std::string, material_t> materials;
-        std::unordered_map<std::string, skeleton_t> skeletons;
+        blender::Map<std::string, mesh_t> meshes;
+        blender::Map<std::string, image_t> images;
+        blender::Map<std::string, material_t> materials;
+        blender::Map<std::string, skeleton_t> skeletons;
         blender::Vector<animation_t> animations;
     };
 
@@ -986,8 +986,9 @@ static void dbg_data(const data_t& data)
         for (const auto& scene : data.scenes)
         {
             CLOG_DEBUG(&LOG, "  scene: %s", scene.name.c_str());
-            for (const auto& [elem_name, elem] : scene.elems)
+            for (auto elem_item : scene.elems.items())
             {
+                const scene_elem_t& elem = elem_item.value;
                 CLOG_DEBUG(&LOG, "    elem: %s", elem.name.c_str());
                 if (elem.parent_name.has_value())
                 {
@@ -1010,10 +1011,11 @@ static void dbg_data(const data_t& data)
 
     // Meshes
     {
-        CLOG_DEBUG(&LOG, "MESHES (%zu):", data.meshes.size());
-        for (const auto& [mesh_name, mesh] : data.meshes)
+        CLOG_DEBUG(&LOG, "MESHES (%ld):", data.meshes.size());
+        for (auto mesh_item : data.meshes.items())
         {
-            size_t total_tris = 0;
+            const mesh_t& mesh = mesh_item.value;
+            size_t total_tris  = 0;
             for (const auto& submesh : mesh.submeshes)
             {
                 total_tris += submesh.triangles.size();
@@ -1029,18 +1031,20 @@ static void dbg_data(const data_t& data)
 
     // Images
     {
-        CLOG_DEBUG(&LOG, "IMAGES (%zu):", data.images.size());
-        for (const auto& [image_name, image] : data.images)
+        CLOG_DEBUG(&LOG, "IMAGES (%ld):", data.images.size());
+        for (auto image_item : data.images.items())
         {
+            const image_t& image = image_item.value;
             CLOG_DEBUG(&LOG, "  image: %s (%ux%u, srgb=%s, %ld bytes)", image.name.c_str(), image.width, image.height, image.is_srgb ? "true" : "false", image.rgba_data.size());
         }
     }
 
     // Materials
     {
-        CLOG_DEBUG(&LOG, "MATERIALS (%zu):", data.materials.size());
-        for (const auto& [mat_name, mat] : data.materials)
+        CLOG_DEBUG(&LOG, "MATERIALS (%ld):", data.materials.size());
+        for (auto mat_item : data.materials.items())
         {
+            const material_t& mat = mat_item.value;
             CLOG_DEBUG(&LOG, "  material: %s (%ld nodes, %ld links)", mat.name.c_str(), mat.nodes.size(), mat.links.size());
             for (size_t i = 0; i < mat.nodes.size(); i++)
             {
@@ -1102,9 +1106,10 @@ static void dbg_data(const data_t& data)
 
     // Skeletons
     {
-        CLOG_DEBUG(&LOG, "SKELETONS (%zu):", data.skeletons.size());
-        for (const auto& [skel_name, skel] : data.skeletons)
+        CLOG_DEBUG(&LOG, "SKELETONS (%ld):", data.skeletons.size());
+        for (auto skel_item : data.skeletons.items())
         {
+            const skeleton_t& skel = skel_item.value;
             CLOG_DEBUG(&LOG, "  skeleton: %s (%ld bones)", skel.name.c_str(), skel.bones.size());
             for (size_t i = 0; i < skel.bones.size(); i++)
             {
@@ -1161,7 +1166,7 @@ struct socket_endpoint_t
 // =========================================================================================================================================
 // =========================================================================================================================================
 // =========================================================================================================================================
-static void recurs_flatten_node_tree(bNodeTree* tree, const std::string& prefix, material_t& material_data, const std::map<std::string, socket_endpoint_t>& input_mappings, std::map<std::string, socket_endpoint_t>& output_mappings)
+static void recurs_flatten_node_tree(bNodeTree* tree, const std::string& prefix, material_t& material_data, const blender::Map<std::string, socket_endpoint_t>& input_mappings, blender::Map<std::string, socket_endpoint_t>& output_mappings)
 {
     if (tree == nullptr) return;
 
@@ -1181,9 +1186,9 @@ static void recurs_flatten_node_tree(bNodeTree* tree, const std::string& prefix,
     };
 
     // First pass: identify group nodes, build their io mappings, collect internal links for resolving group io
-    std::map<std::string, bNodeTree*> group_trees;
-    std::map<std::string, std::map<std::string, socket_endpoint_t>> group_input_maps;
-    std::map<std::string, std::map<std::string, socket_endpoint_t>> group_output_maps;
+    blender::Map<std::string, bNodeTree*> group_trees;
+    blender::Map<std::string, blender::Map<std::string, socket_endpoint_t>> group_input_maps;
+    blender::Map<std::string, blender::Map<std::string, socket_endpoint_t>> group_output_maps;
     for (bNode* node : tree->group_nodes())
     {
         if (node->id == nullptr)
@@ -1191,16 +1196,16 @@ static void recurs_flatten_node_tree(bNodeTree* tree, const std::string& prefix,
             continue;
         }
 
-        bNodeTree* group_tree   = (bNodeTree*)node->id;
-        group_trees[node->name] = group_tree;
+        bNodeTree* group_tree = (bNodeTree*)node->id;
+        group_trees.add(node->name, group_tree);
 
         // Ensure topology cache for the group tree to use all_links()
         group_tree->ensure_topology_cache();
         for (const bNodeLink* link : group_tree->all_links())
         {
             if (!link->fromnode || !link->tonode || !link->fromsock || !link->tosock) continue;
-            if (link->fromnode->is_group_input()) group_input_maps[node->name][link->fromsock->identifier] = {prefix + node->name + "." + link->tonode->name, link->tosock->identifier};
-            if (link->tonode->is_group_output()) group_output_maps[node->name][link->tosock->identifier] = {prefix + node->name + "." + link->fromnode->name, link->fromsock->identifier};
+            if (link->fromnode->is_group_input()) group_input_maps.lookup_or_add_default(node->name).add(link->fromsock->identifier, {prefix + node->name + "." + link->tonode->name, link->tosock->identifier});
+            if (link->tonode->is_group_output()) group_output_maps.lookup_or_add_default(node->name).add(link->tosock->identifier, {prefix + node->name + "." + link->fromnode->name, link->fromsock->identifier});
         }
     }
 
@@ -1214,7 +1219,7 @@ static void recurs_flatten_node_tree(bNodeTree* tree, const std::string& prefix,
         }
         else if (node->is_group() && node->id != nullptr)
         {
-            std::map<std::string, socket_endpoint_t> nested_input_mappings;
+            blender::Map<std::string, socket_endpoint_t> nested_input_mappings;
             for (bNodeSocket* input_sock : node->input_sockets())
             {
                 // Use topology cache to get logical source (handles reroutes automatically)
@@ -1223,36 +1228,39 @@ static void recurs_flatten_node_tree(bNodeTree* tree, const std::string& prefix,
 
                 if (resolved_node->is_group())
                 {
-                    auto& src_output_map = group_output_maps[resolved_node->name];
-                    auto it              = src_output_map.find(resolved_sock->identifier);
-                    if (it != src_output_map.end())
+                    blender::Map<std::string, socket_endpoint_t>* src_output_map = group_output_maps.lookup_ptr(resolved_node->name);
+                    if (src_output_map)
                     {
-                        nested_input_mappings[input_sock->identifier] = it->second;
-                        continue;
+                        const socket_endpoint_t* endpoint = src_output_map->lookup_ptr(resolved_sock->identifier);
+                        if (endpoint)
+                        {
+                            nested_input_mappings.add(input_sock->identifier, *endpoint);
+                            continue;
+                        }
                     }
                 }
                 else if (resolved_node->is_group_input())
                 {
-                    auto it = input_mappings.find(resolved_sock->identifier);
-                    if (it != input_mappings.end())
+                    const socket_endpoint_t* endpoint = input_mappings.lookup_ptr(resolved_sock->identifier);
+                    if (endpoint)
                     {
-                        nested_input_mappings[input_sock->identifier] = it->second;
+                        nested_input_mappings.add(input_sock->identifier, *endpoint);
                         continue;
                     }
                 }
 
-                std::string from_node_name                    = prefix + resolved_node->name;
-                nested_input_mappings[input_sock->identifier] = {from_node_name, std::string(resolved_sock->identifier)};
+                std::string from_node_name = prefix + resolved_node->name;
+                nested_input_mappings.add(input_sock->identifier, {from_node_name, std::string(resolved_sock->identifier)});
             }
 
             // Recursively flatten the group
             bNodeTree* group_tree    = (bNodeTree*)node->id;
             std::string group_prefix = prefix + node->name + ".";
-            std::map<std::string, socket_endpoint_t> nested_output_mappings;
+            blender::Map<std::string, socket_endpoint_t> nested_output_mappings;
             recurs_flatten_node_tree(group_tree, group_prefix, material_data, nested_input_mappings, nested_output_mappings);
 
             // Store output mappings for link resolution
-            group_output_maps[node->name] = nested_output_mappings;
+            group_output_maps.add_overwrite(node->name, nested_output_mappings);
         }
         else
         {
@@ -1558,26 +1566,29 @@ static void recurs_flatten_node_tree(bNodeTree* tree, const std::string& prefix,
 
             if (resolved_node->is_group())
             {
-                auto& src_output_map = group_output_maps[resolved_node->name];
-                auto it              = src_output_map.find(resolved_sock->identifier);
-                if (it != src_output_map.end())
+                blender::Map<std::string, socket_endpoint_t>* src_output_map = group_output_maps.lookup_ptr(resolved_node->name);
+                if (src_output_map)
                 {
-                    from_node_name = it->second.node_name;
-                    from_socket    = it->second.socket_id;
+                    const socket_endpoint_t* endpoint = src_output_map->lookup_ptr(resolved_sock->identifier);
+                    if (endpoint)
+                    {
+                        from_node_name = endpoint->node_name;
+                        from_socket    = endpoint->socket_id;
+                    }
                 }
             }
             else if (resolved_node->is_group_input())
             {
                 // Handle GroupInput -> Reroute -> GroupOutput (pass-through)
-                auto it = input_mappings.find(resolved_sock->identifier);
-                if (it != input_mappings.end())
+                const socket_endpoint_t* endpoint = input_mappings.lookup_ptr(resolved_sock->identifier);
+                if (endpoint)
                 {
-                    from_node_name = it->second.node_name;
-                    from_socket    = it->second.socket_id;
+                    from_node_name = endpoint->node_name;
+                    from_socket    = endpoint->socket_id;
                 }
             }
 
-            output_mappings[input_sock->identifier] = {from_node_name, from_socket};
+            output_mappings.add(input_sock->identifier, {from_node_name, from_socket});
         }
     }
 
@@ -1598,28 +1609,31 @@ static void recurs_flatten_node_tree(bNodeTree* tree, const std::string& prefix,
 
             if (resolved_node->is_group())
             {
-                auto& src_output_map = group_output_maps[resolved_node->name];
-                auto it              = src_output_map.find(resolved_sock->identifier);
-                if (it != src_output_map.end())
+                blender::Map<std::string, socket_endpoint_t>* src_output_map = group_output_maps.lookup_ptr(resolved_node->name);
+                if (src_output_map)
                 {
-                    shader_link_t link_data;
-                    link_data.from_node   = it->second.node_name;
-                    link_data.from_socket = it->second.socket_id;
-                    link_data.to_node     = prefix + node->name;
-                    link_data.to_socket   = input_sock->identifier;
-                    material_data.links.append(link_data);
+                    const socket_endpoint_t* endpoint = src_output_map->lookup_ptr(resolved_sock->identifier);
+                    if (endpoint)
+                    {
+                        shader_link_t link_data;
+                        link_data.from_node   = endpoint->node_name;
+                        link_data.from_socket = endpoint->socket_id;
+                        link_data.to_node     = prefix + node->name;
+                        link_data.to_socket   = input_sock->identifier;
+                        material_data.links.append(link_data);
+                    }
                 }
                 continue;
             }
 
             if (resolved_node->is_group_input())
             {
-                auto it = input_mappings.find(resolved_sock->identifier);
-                if (it != input_mappings.end())
+                const socket_endpoint_t* endpoint = input_mappings.lookup_ptr(resolved_sock->identifier);
+                if (endpoint)
                 {
                     shader_link_t link_data;
-                    link_data.from_node   = it->second.node_name;
-                    link_data.from_socket = it->second.socket_id;
+                    link_data.from_node   = endpoint->node_name;
+                    link_data.from_socket = endpoint->socket_id;
                     link_data.to_node     = prefix + node->name;
                     link_data.to_socket   = input_sock->identifier;
                     material_data.links.append(link_data);
@@ -1685,8 +1699,8 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
 
             // Flatten tree
             {
-                std::map<std::string, socket_endpoint_t> input_mappings;
-                std::map<std::string, socket_endpoint_t> output_mappings;
+                blender::Map<std::string, socket_endpoint_t> input_mappings;
+                blender::Map<std::string, socket_endpoint_t> output_mappings;
 
                 recurs_flatten_node_tree(mat->nodetree, "", material_data, input_mappings, output_mappings);
             }
@@ -1931,10 +1945,10 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 }
             }
 
-            material_data.nodes                = filtered_nodes;
-            material_data.links                = filtered_links;
+            material_data.nodes = filtered_nodes;
+            material_data.links = filtered_links;
 
-            data.materials[material_data.name] = material_data;
+            data.materials.add(material_data.name, material_data);
         }
     }
 
@@ -1944,16 +1958,6 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
     // ===============================================================================================
     // ===============================================================================================
     {
-        auto normalize_bone_name = [](const char* name) -> std::string
-        {
-            std::string result = name;
-            for (char& c : result)
-            {
-                if (c == ' ') c = '_';
-            }
-            return result;
-        };
-
         LISTBASE_FOREACH(Mesh*, mesh, &bmain->meshes)
         {
             // Check for invalid material slots
@@ -1973,7 +1977,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                         break;
                     }
                     std::string mat_name = mesh->mat[i]->id.name;
-                    if (data.materials.find(mat_name) == data.materials.end())
+                    if (!data.materials.contains(mat_name))
                     {
                         CLOG_INFO(&LOG, "Skipping mesh %s (material %s not in map)", mesh->id.name, mat_name.c_str());
                         has_invalid_material = true;
@@ -2000,7 +2004,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
 
             // Find the armature associated with this mesh (via parent)
             bArmature* armature = nullptr;
-            std::map<std::string, int> bone_name_to_idx;
+            blender::Map<blender::StringRef, int> bone_name_to_idx;
             if (mesh_obj != nullptr)
             {
                 // Check if parent is an armature
@@ -2009,13 +2013,13 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                     armature = (bArmature*)mesh_obj->parent->data;
                 }
 
-                // Build bone name -> index map if we have an armature
+                // Build bone name -> index map if we have an armature (using original names)
                 if (armature != nullptr)
                 {
                     int bone_idx                             = 0;
                     std::function<void(Bone*)> collect_bones = [&](Bone* bone)
                     {
-                        bone_name_to_idx[normalize_bone_name(bone->name)] = bone_idx++;
+                        bone_name_to_idx.add(bone->name, bone_idx++);
                         for (Bone* child : blender::ListBaseWrapper<Bone>(bone->childbase))
                         {
                             collect_bones(child);
@@ -2028,18 +2032,17 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 }
             }
 
-            // Build vertex group index -> bone index map
-            std::map<int, int> vgroup_to_bone;
+            // Build vertex group index -> bone index map (vertex group names match bone names in Blender)
+            blender::Map<int, int> vgroup_to_bone;
             if (armature != nullptr)
             {
                 int vgroup_idx = 0;
                 for (bDeformGroup* dg : blender::ListBaseWrapper<bDeformGroup>(mesh->vertex_group_names))
                 {
-                    std::string vg_name = normalize_bone_name(dg->name);
-                    auto it             = bone_name_to_idx.find(vg_name);
-                    if (it != bone_name_to_idx.end())
+                    const int* bone_idx = bone_name_to_idx.lookup_ptr(dg->name);
+                    if (bone_idx)
                     {
-                        vgroup_to_bone[vgroup_idx] = it->second;
+                        vgroup_to_bone.add(vgroup_idx, *bone_idx);
                     }
                     vgroup_idx++;
                 }
@@ -2060,13 +2063,13 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
 
             // Get deform verts for skinning
             blender::Span<MDeformVert> deform_verts = mesh->deform_verts();
-            bool has_skinning                       = !deform_verts.is_empty() && !vgroup_to_bone.empty();
+            bool has_skinning                       = !deform_verts.is_empty() && !vgroup_to_bone.is_empty();
 
             mesh_t mesh_data;
             mesh_data.name = mesh->id.name;
 
             // Group triangles by material index
-            std::map<int, blender::Vector<int>> triangles_by_material;
+            blender::Map<int, blender::Vector<int>> triangles_by_material;
             {
                 const blender::VArray<int> material_indices_varray = *attributes.lookup_or_default<int>("material_index", blender::bke::AttrDomain::Face, 0);
                 blender::VArraySpan<int> material_indices(material_indices_varray);
@@ -2075,13 +2078,13 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 {
                     int face_idx = corner_tri_faces[tri_idx];
                     int mat_idx  = material_indices[face_idx];
-                    triangles_by_material[mat_idx].append(tri_idx);
+                    triangles_by_material.lookup_or_add_default(mat_idx).append(tri_idx);
                 }
             }
 
             // Check for invalid material indices and skip entire mesh if found
             bool has_invalid_mat_idx = false;
-            for (const auto& [mat_idx, _] : triangles_by_material)
+            for (int mat_idx : triangles_by_material.keys())
             {
                 if (mat_idx < 0 || mat_idx >= mesh->totcol || !mesh->mat[mat_idx])
                 {
@@ -2096,13 +2099,15 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
             }
 
             // Create submeshes from grouped triangles
-            for (const auto& [mat_idx, triangle_indices] : triangles_by_material)
+            for (auto tri_item : triangles_by_material.items())
             {
+                int mat_idx                             = tri_item.key;
+                const blender::Vector<int>& tri_indices = tri_item.value;
                 submesh_t submesh;
 
                 submesh.material_name = mesh->mat[mat_idx]->id.name;
 
-                for (int tri_idx : triangle_indices)
+                for (int tri_idx : tri_indices)
                 {
                     blender::int3 tri   = corner_tris[tri_idx];
                     triangle_t triangle = {};
@@ -2143,10 +2148,10 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                             for (int w = 0; w < dvert.totweight; w++)
                             {
                                 const MDeformWeight& dw = dvert.dw[w];
-                                auto it                 = vgroup_to_bone.find(dw.def_nr);
-                                if (it != vgroup_to_bone.end())
+                                const int* bone_idx     = vgroup_to_bone.lookup_ptr(dw.def_nr);
+                                if (bone_idx)
                                 {
-                                    influences.append({dw.weight, it->second});
+                                    influences.append({dw.weight, *bone_idx});
                                 }
                             }
 
@@ -2178,7 +2183,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 mesh_data.submeshes.append(submesh);
             }
 
-            data.meshes[mesh_data.name] = std::move(mesh_data);
+            data.meshes.add(mesh_data.name, mesh_data);
         }
     }
 
@@ -2203,47 +2208,47 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 {
                     Mesh* mesh            = (Mesh*)ob->data;
                     std::string mesh_name = mesh->id.name;
-                    if (data.meshes.find(mesh_name) == data.meshes.end())
+                    if (!data.meshes.contains(mesh_name))
                     {
                         continue;
                     }
 
-                    scene_elem_t elem           = {};
-                    elem.name                   = ob->id.name;
-                    elem.parent_name            = parent_name;
-                    elem.pos.x                  = ob->loc[0];
-                    elem.pos.y                  = ob->loc[1];
-                    elem.pos.z                  = ob->loc[2];
-                    elem.euler_rot.x            = ob->rot[0];
-                    elem.euler_rot.y            = ob->rot[1];
-                    elem.euler_rot.z            = ob->rot[2];
-                    elem.scale.x                = ob->scale[0];
-                    elem.scale.y                = ob->scale[1];
-                    elem.scale.z                = ob->scale[2];
-                    elem.mesh_name              = mesh_name;
+                    scene_elem_t elem = {};
+                    elem.name         = ob->id.name;
+                    elem.parent_name  = parent_name;
+                    elem.pos.x        = ob->loc[0];
+                    elem.pos.y        = ob->loc[1];
+                    elem.pos.z        = ob->loc[2];
+                    elem.euler_rot.x  = ob->rot[0];
+                    elem.euler_rot.y  = ob->rot[1];
+                    elem.euler_rot.z  = ob->rot[2];
+                    elem.scale.x      = ob->scale[0];
+                    elem.scale.y      = ob->scale[1];
+                    elem.scale.z      = ob->scale[2];
+                    elem.mesh_name    = mesh_name;
 
-                    scene_data.elems[elem.name] = std::move(elem);
+                    scene_data.elems.add(elem.name, elem);
                 }
                 else if (ob->type == OB_ARMATURE)
                 {
-                    bArmature* arm              = (bArmature*)ob->data;
-                    std::string skel_name       = arm->id.name;
+                    bArmature* arm        = (bArmature*)ob->data;
+                    std::string skel_name = arm->id.name;
 
-                    scene_elem_t elem           = {};
-                    elem.name                   = ob->id.name;
-                    elem.parent_name            = parent_name;
-                    elem.pos.x                  = ob->loc[0];
-                    elem.pos.y                  = ob->loc[1];
-                    elem.pos.z                  = ob->loc[2];
-                    elem.euler_rot.x            = ob->rot[0];
-                    elem.euler_rot.y            = ob->rot[1];
-                    elem.euler_rot.z            = ob->rot[2];
-                    elem.scale.x                = ob->scale[0];
-                    elem.scale.y                = ob->scale[1];
-                    elem.scale.z                = ob->scale[2];
-                    elem.skel_name              = skel_name;
+                    scene_elem_t elem     = {};
+                    elem.name             = ob->id.name;
+                    elem.parent_name      = parent_name;
+                    elem.pos.x            = ob->loc[0];
+                    elem.pos.y            = ob->loc[1];
+                    elem.pos.z            = ob->loc[2];
+                    elem.euler_rot.x      = ob->rot[0];
+                    elem.euler_rot.y      = ob->rot[1];
+                    elem.euler_rot.z      = ob->rot[2];
+                    elem.scale.x          = ob->scale[0];
+                    elem.scale.y          = ob->scale[1];
+                    elem.scale.z          = ob->scale[2];
+                    elem.skel_name        = skel_name;
 
-                    scene_data.elems[elem.name] = std::move(elem);
+                    scene_data.elems.add(elem.name, elem);
                 }
             }
             FOREACH_SCENE_OBJECT_END;
@@ -2309,7 +2314,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 memcpy(image.rgba_data.data(), ibuf->byte_buffer.data, data_size);
 
                 IMB_freeImBuf(ibuf);
-                data.images[image.name] = std::move(image);
+                data.images.add(image.name, image);
             }
         }
     }
@@ -2320,31 +2325,21 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
     // ===============================================================================================
     // ===============================================================================================
     {
-        auto normalize_bone_name = [](const char* name) -> std::string
-        {
-            std::string result = name;
-            for (char& c : result)
-            {
-                if (c == ' ') c = '_';
-            }
-            return result;
-        };
-
         LISTBASE_FOREACH(bArmature*, arm, &bmain->armatures)
         {
             skeleton_t skel;
             skel.name = arm->id.name;
 
-            // Build bone index map and collect bones in order
-            std::map<std::string, int> bone_name_to_index;
+            // Build bone index map and collect bones in order (using original names)
+            blender::Map<blender::StringRef, int> bone_name_to_index;
             blender::Vector<Bone*> bone_list;
             blender::Vector<blender::float4x4> inv_mats; // Store inverse matrices as float4x4
 
             // Recursive function to traverse bone hierarchy
             std::function<void(Bone*)> collect_bones = [&](Bone* bone)
             {
-                int idx                                             = (int)bone_list.size();
-                bone_name_to_index[normalize_bone_name(bone->name)] = idx;
+                int idx = (int)bone_list.size();
+                bone_name_to_index.add(bone->name, idx);
                 bone_list.append(bone);
 
                 for (Bone* child : blender::ListBaseWrapper<Bone>(bone->childbase))
@@ -2364,13 +2359,12 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
             {
                 Bone* bone = bone_list[i];
                 bone_t bone_data;
-                bone_data.name = normalize_bone_name(bone->name);
+                bone_data.name = bone->name; // Store original name, normalize during export
 
                 // Parent index
                 if (bone->parent)
                 {
-                    auto it                = bone_name_to_index.find(normalize_bone_name(bone->parent->name));
-                    bone_data.parent_index = (it != bone_name_to_index.end()) ? it->second : -1;
+                    bone_data.parent_index = bone_name_to_index.lookup_default(bone->parent->name, -1);
                 }
                 else
                 {
@@ -2422,7 +2416,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 skel.bones.append(bone_data);
             }
 
-            data.skeletons[skel.name] = std::move(skel);
+            data.skeletons.add(skel.name, skel);
             CLOG_INFO(&LOG, "Processed skeleton: %s (%ld bones)", arm->id.name, bone_list.size());
         }
     }
@@ -2433,16 +2427,6 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
     // ===============================================================================================
     // ===============================================================================================
     {
-        auto normalize_bone_name = [](const char* name) -> std::string
-        {
-            std::string result = name;
-            for (char& c : result)
-            {
-                if (c == ' ') c = '_';
-            }
-            return result;
-        };
-
         // Euler to quaternion conversion using blender::math
         auto euler_to_quat = [](float x, float y, float z) -> std::array<float, 4>
         {
@@ -2453,7 +2437,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
         };
 
         // Helper lambda to process FCurves from an action into animation channels
-        auto process_action_fcurves = [&](bAction* action, bArmature* arm, const std::map<std::string, int>& bone_name_to_index, const std::function<std::array<float, 4>(float, float, float)>& euler_to_quat_fn) -> std::optional<animation_t>
+        auto process_action_fcurves = [&](bAction* action, bArmature* arm, const blender::Map<blender::StringRef, int>& bone_name_to_index, const std::function<std::array<float, 4>(float, float, float)>& euler_to_quat_fn) -> std::optional<animation_t>
         {
             // Collect all FCurves from this action using the modern animrig API
             blender::Vector<FCurve*> all_fcurves;
@@ -2505,19 +2489,21 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
             anim.armature_name = arm->id.name;
 
             // Group FCurves by data_path (bone + transform type)
-            std::map<std::string, std::map<int, FCurve*>> grouped_fcurves;
+            blender::Map<std::string, blender::Map<int, FCurve*>> grouped_fcurves;
             for (FCurve* fcurve : all_fcurves)
             {
                 if (fcurve->rna_path == nullptr) continue;
-                grouped_fcurves[fcurve->rna_path][fcurve->array_index] = fcurve;
+                grouped_fcurves.lookup_or_add_default(fcurve->rna_path).add(fcurve->array_index, fcurve);
             }
 
             // Process each grouped fcurve set
             // Parse pattern: pose.bones["bonename"].transform_type using StringRef (faster than std::regex)
             constexpr blender::StringRef prefix = "pose.bones[\"";
 
-            for (auto& [data_path, fcurve_map] : grouped_fcurves)
+            for (auto item : grouped_fcurves.items())
             {
+                const std::string& data_path           = item.key;
+                blender::Map<int, FCurve*>& fcurve_map = item.value;
                 blender::StringRef path_ref(data_path);
 
                 // Check for prefix and extract bone name
@@ -2534,17 +2520,17 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                     continue;
                 }
 
-                std::string bone_name      = normalize_bone_name(std::string(path_ref.substr(0, end_quote)).c_str());
-                std::string transform_type = std::string(path_ref.drop_prefix(end_quote + 3));
+                blender::StringRef bone_name = path_ref.substr(0, end_quote);
+                std::string transform_type   = std::string(path_ref.drop_prefix(end_quote + 3));
 
-                auto bone_it               = bone_name_to_index.find(bone_name);
-                if (bone_it == bone_name_to_index.end())
+                const int* bone_idx          = bone_name_to_index.lookup_ptr(bone_name);
+                if (!bone_idx)
                 {
                     continue;
                 }
 
                 anim_channel_t channel;
-                channel.bone_index         = bone_it->second;
+                channel.bone_index         = *bone_idx;
                 channel.interpolation_type = anim_interpolation_type_t::LINEAR;
 
                 bool is_euler              = false;
@@ -2571,13 +2557,14 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 }
 
                 // Collect all unique keyframe times
-                std::set<float> keyframe_times_set;
-                for (auto& [arr_idx, fcurve] : fcurve_map)
+                blender::Set<float> keyframe_times_set;
+                for (auto fcurve_item : fcurve_map.items())
                 {
+                    FCurve* fcurve = fcurve_item.value;
                     if (fcurve->bezt == nullptr) continue;
                     for (unsigned int i = 0; i < fcurve->totvert; i++)
                     {
-                        keyframe_times_set.insert(fcurve->bezt[i].vec[1][0]);
+                        keyframe_times_set.add(fcurve->bezt[i].vec[1][0]);
                     }
                 }
 
@@ -2601,8 +2588,10 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                         values[0] = values[1] = values[2] = 1.0f;
                     }
 
-                    for (auto& [arr_idx, fcurve] : fcurve_map)
+                    for (auto fcurve_item : fcurve_map.items())
                     {
+                        int arr_idx    = fcurve_item.key;
+                        FCurve* fcurve = fcurve_item.value;
                         if (fcurve->bezt == nullptr) continue;
 
                         // Find keyframe at this time or interpolate
@@ -2658,7 +2647,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
 
                 if (!channel.keyframe_times.is_empty())
                 {
-                    anim.channels.append(std::move(channel));
+                    anim.channels.append(channel);
                 }
             }
 
@@ -2678,13 +2667,13 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
             bArmature* arm = (bArmature*)ob->data;
             if (arm == nullptr) continue;
 
-            // Build bone name to index map for this armature
-            std::map<std::string, int> bone_name_to_index;
+            // Build bone name to index map for this armature (using original names)
+            blender::Map<blender::StringRef, int> bone_name_to_index;
             {
                 int idx                            = 0;
                 std::function<void(Bone*)> collect = [&](Bone* bone)
                 {
-                    bone_name_to_index[normalize_bone_name(bone->name)] = idx++;
+                    bone_name_to_index.add(bone->name, idx++);
                     for (Bone* child : blender::ListBaseWrapper<Bone>(bone->childbase))
                     {
                         collect(child);
@@ -2708,7 +2697,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                     auto result = process_action_fcurves(action, arm, bone_name_to_index, euler_to_quat);
                     if (result.has_value())
                     {
-                        data.animations.append(std::move(result.value()));
+                        data.animations.append(result.value());
                         CLOG_INFO(&LOG, "Processed animation: %s (%ld channels)", action->id.name, data.animations.last().channels.size());
                     }
                 }
@@ -2758,9 +2747,9 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
         meshes       = (BBArchiveMesh*)arena_alloc_z(arena, sizeof(BBArchiveMesh) * mesh_count)->data;
 
         int mesh_idx = 0;
-        for (const auto& [mesh_name, mesh] : data.meshes)
+        for (auto mesh_item : data.meshes.items())
         {
-
+            const mesh_t& mesh          = mesh_item.value;
             int submesh_count           = mesh.submeshes.size();
             BBArchiveSubmesh* submeshes = (BBArchiveSubmesh*)arena_alloc_z(arena, sizeof(BBArchiveSubmesh) * submesh_count)->data;
 
@@ -2855,19 +2844,20 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
             const scene_t& scene   = data.scenes[scene_idx];
 
             size_t mesh_elem_count = 0;
-            for (const auto& [elem_name, src_elem] : scene.elems)
+            for (auto elem_item : scene.elems.items())
             {
-                if (src_elem.mesh_name.has_value()) mesh_elem_count++;
+                if (elem_item.value.mesh_name.has_value()) mesh_elem_count++;
             }
 
             BBArchiveSceneElem* elems = (BBArchiveSceneElem*)arena_alloc_z(arena, sizeof(BBArchiveSceneElem) * mesh_elem_count)->data;
 
             size_t elem_idx           = 0;
-            for (const auto& [elem_name, src_elem] : scene.elems)
+            for (auto elem_item : scene.elems.items())
             {
+                const scene_elem_t& src_elem = elem_item.value;
                 if (!src_elem.mesh_name.has_value()) continue;
 
-                const mesh_t& mesh     = data.meshes.at(src_elem.mesh_name.value());
+                const mesh_t& mesh     = data.meshes.lookup(src_elem.mesh_name.value());
 
                 int mat_count          = mesh.submeshes.size();
                 const char** mat_names = (const char**)arena_alloc_z(arena, sizeof(const char*) * mat_count)->data;
@@ -2909,8 +2899,9 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
         bb_images.resize(data.images.size());
 
         size_t image_idx = 0;
-        for (const auto& [image_name, image] : data.images)
+        for (auto image_item : data.images.items())
         {
+            const image_t& image      = image_item.value;
             BBArchiveImage& bb_image  = bb_images[image_idx];
             bb_image.image_name       = normalize_string(image.name);
             bb_image.width            = image.width;
@@ -2991,10 +2982,11 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
 
         bb_shaders.reserve(data.materials.size());
 
-        for (const auto& [mat_name, mat] : data.materials)
+        for (auto mat_item : data.materials.items())
         {
+            const material_t& mat = mat_item.value;
             // Build node name to index map
-            std::unordered_map<std::string, uint32_t> node_name_to_idx;
+            blender::Map<std::string, uint32_t> node_name_to_idx;
             blender::Vector<std::pair<const shader_node_t*, bb_shader_node_type_e>> valid_nodes;
 
             for (const auto& node : mat.nodes)
@@ -3006,7 +2998,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 {
                     CLOG_FATAL(&LOG, "Unknown node type '%s' in material '%s'", node.idname.c_str(), mat.name.c_str());
                 }
-                node_name_to_idx[node.name] = valid_nodes.size();
+                node_name_to_idx.add(node.name, (uint32_t)valid_nodes.size());
                 valid_nodes.append({&node, node_type_opt.value()});
             }
 
@@ -3070,19 +3062,19 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
             blender::Vector<BBArchiveShaderLink> links;
             for (const auto& link : mat.links)
             {
-                auto src_it = node_name_to_idx.find(link.from_node);
-                auto dst_it = node_name_to_idx.find(link.to_node);
-                if (src_it == node_name_to_idx.end())
+                const uint32_t* src_idx_ptr = node_name_to_idx.lookup_ptr(link.from_node);
+                const uint32_t* dst_idx_ptr = node_name_to_idx.lookup_ptr(link.to_node);
+                if (!src_idx_ptr)
                 {
                     CLOG_FATAL(&LOG, "Link source node '%s' not found in material '%s'", link.from_node.c_str(), mat.name.c_str());
                 }
-                if (dst_it == node_name_to_idx.end())
+                if (!dst_idx_ptr)
                 {
                     CLOG_FATAL(&LOG, "Link destination node '%s' not found in material '%s'", link.to_node.c_str(), mat.name.c_str());
                 }
 
-                uint32_t src_idx               = src_it->second;
-                uint32_t dst_idx               = dst_it->second;
+                uint32_t src_idx               = *src_idx_ptr;
+                uint32_t dst_idx               = *dst_idx_ptr;
                 bb_shader_node_type_e src_type = valid_nodes[src_idx].second;
                 bb_shader_node_type_e dst_type = valid_nodes[dst_idx].second;
 
@@ -3155,8 +3147,9 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
     {
         bb_skeletons.reserve(data.skeletons.size());
 
-        for (const auto& [skel_name, skel] : data.skeletons)
+        for (auto skel_item : data.skeletons.items())
         {
+            const skeleton_t& skel  = skel_item.value;
             size_t bone_count       = skel.bones.size();
 
             // Allocate bone names array
