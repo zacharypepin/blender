@@ -3,12 +3,14 @@
 # SPDX-License-Identifier: GPL-2.0-or-later
 
 set(INC
+  ../blender/animrig
   ../blender/editors/include
   ../blender/io/usd
   ../blender/makesrna
 )
 
 set(LIB
+  PRIVATE bf::animrig
   PRIVATE bf::blenkernel
   PRIVATE bf::blenlib
   PRIVATE bf::bmesh
