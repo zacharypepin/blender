@@ -151,7 +151,7 @@ namespace
     struct shader_node_socket_t
     {
         std::string identifier;
-        std::string idname; // e.g. "NodeSocketColor", "NodeSocketFloat"
+        std::string idname;
         std::optional<socket_default_value_t> default_value;
     };
 
@@ -164,7 +164,7 @@ namespace
     struct shader_node_t
     {
         std::string name;
-        std::string idname; // e.g. "ShaderNodeTexImage", "ShaderNodeBsdfPrincipled"
+        std::string idname;
         blender::Vector<shader_node_socket_t> inputs;
         blender::Vector<shader_node_socket_t> outputs;
         blender::Vector<shader_node_prop_t> props;
@@ -188,9 +188,9 @@ namespace
     struct bone_t
     {
         std::string name;
-        int parent_index;                          // -1 for root
-        std::array<float, 16> bind_local_matrix;   // row-major 4x4
-        std::array<float, 16> inverse_bind_matrix; // row-major 4x4
+        int parent_index;
+        std::array<float, 16> bind_local_matrix;
+        std::array<float, 16> inverse_bind_matrix;
     };
 
     struct skeleton_t
@@ -220,7 +220,7 @@ namespace
         anim_channel_type_t channel_type;
         anim_interpolation_type_t interpolation_type;
         blender::Vector<float> keyframe_times;
-        blender::Vector<std::array<float, 4>> keyframe_values; // vec4 for all types (quat for rotation)
+        blender::Vector<std::array<float, 4>> keyframe_values;
     };
 
     struct animation_t
@@ -239,6 +239,748 @@ namespace
         std::unordered_map<std::string, skeleton_t> skeletons;
         blender::Vector<animation_t> animations;
     };
+}
+
+// =========================================================================================================================================
+// =========================================================================================================================================
+// =========================================================================================================================================
+// =========================================================================================================================================
+static void dbg_data(const data_t& data)
+{
+    CLOG_DEBUG(&LOG, "=== DATA DUMP ===");
+
+    // Scenes
+    {
+        CLOG_DEBUG(&LOG, "SCENES (%ld):", data.scenes.size());
+        for (const auto& scene : data.scenes)
+        {
+            CLOG_DEBUG(&LOG, "  scene: %s", scene.name.c_str());
+            for (const auto& [elem_name, elem] : scene.elems)
+            {
+                CLOG_DEBUG(&LOG, "    elem: %s", elem.name.c_str());
+                if (elem.parent_name.has_value())
+                {
+                    CLOG_DEBUG(&LOG, "      parent: %s", elem.parent_name.value().c_str());
+                }
+                CLOG_DEBUG(&LOG, "      pos: (%.3f, %.3f, %.3f)", elem.pos.x, elem.pos.y, elem.pos.z);
+                CLOG_DEBUG(&LOG, "      rot: (%.3f, %.3f, %.3f)", elem.euler_rot.x, elem.euler_rot.y, elem.euler_rot.z);
+                CLOG_DEBUG(&LOG, "      scale: (%.3f, %.3f, %.3f)", elem.scale.x, elem.scale.y, elem.scale.z);
+                if (elem.mesh_name.has_value())
+                {
+                    CLOG_DEBUG(&LOG, "      mesh: %s", elem.mesh_name.value().c_str());
+                }
+                if (elem.skel_name.has_value())
+                {
+                    CLOG_DEBUG(&LOG, "      skel: %s", elem.skel_name.value().c_str());
+                }
+            }
+        }
+    }
+
+    // Meshes
+    {
+        CLOG_DEBUG(&LOG, "MESHES (%zu):", data.meshes.size());
+        for (const auto& [mesh_name, mesh] : data.meshes)
+        {
+            size_t total_tris = 0;
+            for (const auto& submesh : mesh.submeshes)
+            {
+                total_tris += submesh.triangles.size();
+            }
+            CLOG_DEBUG(&LOG, "  mesh: %s (%ld submeshes, %zu triangles)", mesh.name.c_str(), mesh.submeshes.size(), total_tris);
+            for (size_t i = 0; i < mesh.submeshes.size(); i++)
+            {
+                const auto& submesh = mesh.submeshes[i];
+                CLOG_DEBUG(&LOG, "    submesh[%zu]: material=%s, tris=%ld", i, submesh.material_name.c_str(), submesh.triangles.size());
+            }
+        }
+    }
+
+    // Images
+    {
+        CLOG_DEBUG(&LOG, "IMAGES (%zu):", data.images.size());
+        for (const auto& [image_name, image] : data.images)
+        {
+            CLOG_DEBUG(&LOG, "  image: %s (%ux%u, srgb=%s, %ld bytes)", image.name.c_str(), image.width, image.height, image.is_srgb ? "true" : "false", image.rgba_data.size());
+        }
+    }
+
+    // Materials
+    {
+        CLOG_DEBUG(&LOG, "MATERIALS (%zu):", data.materials.size());
+        for (const auto& [mat_name, mat] : data.materials)
+        {
+            CLOG_DEBUG(&LOG, "  material: %s (%ld nodes, %ld links)", mat.name.c_str(), mat.nodes.size(), mat.links.size());
+            for (size_t i = 0; i < mat.nodes.size(); i++)
+            {
+                const auto& node = mat.nodes[i];
+                CLOG_DEBUG(&LOG, "    node[%zu]: %s [%s] (inputs=%ld, outputs=%ld, props=%ld)", i, node.name.c_str(), node.idname.c_str(), node.inputs.size(), node.outputs.size(), node.props.size());
+                auto format_default_value = [](const std::optional<socket_default_value_t>& val) -> std::string
+                {
+                    if (!val.has_value()) return "";
+                    return std::visit(
+                        [](auto&& v) -> std::string
+                        {
+                            using T = std::decay_t<decltype(v)>;
+                            if constexpr (std::is_same_v<T, socket_value_float_t>) return " = " + std::to_string(v.value);
+                            else if constexpr (std::is_same_v<T, socket_value_int_t>) return " = " + std::to_string(v.value);
+                            else if constexpr (std::is_same_v<T, socket_value_bool_t>) return std::string(" = ") + (v.value ? "true" : "false");
+                            else if constexpr (std::is_same_v<T, socket_value_vector_t>) return " = (" + std::to_string(v.value.x) + ", " + std::to_string(v.value.y) + ", " + std::to_string(v.value.z) + ")";
+                            else if constexpr (std::is_same_v<T, socket_value_rgba_t>) return " = (" + std::to_string(v.value.x) + ", " + std::to_string(v.value.y) + ", " + std::to_string(v.value.z) + ", " + std::to_string(v.value.w) + ")";
+                            else if constexpr (std::is_same_v<T, socket_value_tex_t>) return " = \"" + v.value + "\"";
+                            else if constexpr (std::is_same_v<T, socket_value_uv_map_t>) return " = \"" + v.value + "\"";
+                            else return "";
+                        },
+                        val.value()
+                    );
+                };
+                for (const auto& input : node.inputs)
+                {
+                    CLOG_DEBUG(&LOG, "      in: %s (%s)%s", input.identifier.c_str(), input.idname.c_str(), format_default_value(input.default_value).c_str());
+                }
+                for (const auto& output : node.outputs)
+                {
+                    CLOG_DEBUG(&LOG, "      out: %s (%s)%s", output.identifier.c_str(), output.idname.c_str(), format_default_value(output.default_value).c_str());
+                }
+                for (const auto& prop : node.props)
+                {
+                    std::string value_str = std::visit(
+                        [](auto&& v) -> std::string
+                        {
+                            using T = std::decay_t<decltype(v)>;
+                            if constexpr (std::is_same_v<T, socket_value_float_t>) return std::to_string(v.value);
+                            else if constexpr (std::is_same_v<T, socket_value_int_t>) return std::to_string(v.value);
+                            else if constexpr (std::is_same_v<T, socket_value_bool_t>) return v.value ? "true" : "false";
+                            else if constexpr (std::is_same_v<T, socket_value_vector_t>) return "(" + std::to_string(v.value.x) + ", " + std::to_string(v.value.y) + ", " + std::to_string(v.value.z) + ")";
+                            else if constexpr (std::is_same_v<T, socket_value_rgba_t>) return "(" + std::to_string(v.value.x) + ", " + std::to_string(v.value.y) + ", " + std::to_string(v.value.z) + ", " + std::to_string(v.value.w) + ")";
+                            else if constexpr (std::is_same_v<T, socket_value_tex_t>) return "\"" + v.value + "\"";
+                            else if constexpr (std::is_same_v<T, socket_value_uv_map_t>) return "\"" + v.value + "\"";
+                            else return "";
+                        },
+                        prop.value
+                    );
+                    CLOG_DEBUG(&LOG, "      prop: %s = %s", prop.identifier.c_str(), value_str.c_str());
+                }
+            }
+            for (const auto& link : mat.links)
+            {
+                CLOG_DEBUG(&LOG, "    link: %s.%s -> %s.%s", link.from_node.c_str(), link.from_socket.c_str(), link.to_node.c_str(), link.to_socket.c_str());
+            }
+        }
+    }
+
+    // Skeletons
+    {
+        CLOG_DEBUG(&LOG, "SKELETONS (%zu):", data.skeletons.size());
+        for (const auto& [skel_name, skel] : data.skeletons)
+        {
+            CLOG_DEBUG(&LOG, "  skeleton: %s (%ld bones)", skel.name.c_str(), skel.bones.size());
+            for (size_t i = 0; i < skel.bones.size(); i++)
+            {
+                const auto& bone = skel.bones[i];
+                CLOG_DEBUG(&LOG, "    bone[%zu]: %s (parent=%d)", i, bone.name.c_str(), bone.parent_index);
+                CLOG_DEBUG(&LOG, "      bind_local: [%.4f, %.4f, %.4f, %.4f]", bone.bind_local_matrix[0], bone.bind_local_matrix[1], bone.bind_local_matrix[2], bone.bind_local_matrix[3]);
+                CLOG_DEBUG(&LOG, "                  [%.4f, %.4f, %.4f, %.4f]", bone.bind_local_matrix[4], bone.bind_local_matrix[5], bone.bind_local_matrix[6], bone.bind_local_matrix[7]);
+                CLOG_DEBUG(&LOG, "                  [%.4f, %.4f, %.4f, %.4f]", bone.bind_local_matrix[8], bone.bind_local_matrix[9], bone.bind_local_matrix[10], bone.bind_local_matrix[11]);
+                CLOG_DEBUG(&LOG, "                  [%.4f, %.4f, %.4f, %.4f]", bone.bind_local_matrix[12], bone.bind_local_matrix[13], bone.bind_local_matrix[14], bone.bind_local_matrix[15]);
+                CLOG_DEBUG(&LOG, "      inv_bind:   [%.4f, %.4f, %.4f, %.4f]", bone.inverse_bind_matrix[0], bone.inverse_bind_matrix[1], bone.inverse_bind_matrix[2], bone.inverse_bind_matrix[3]);
+                CLOG_DEBUG(&LOG, "                  [%.4f, %.4f, %.4f, %.4f]", bone.inverse_bind_matrix[4], bone.inverse_bind_matrix[5], bone.inverse_bind_matrix[6], bone.inverse_bind_matrix[7]);
+                CLOG_DEBUG(&LOG, "                  [%.4f, %.4f, %.4f, %.4f]", bone.inverse_bind_matrix[8], bone.inverse_bind_matrix[9], bone.inverse_bind_matrix[10], bone.inverse_bind_matrix[11]);
+                CLOG_DEBUG(&LOG, "                  [%.4f, %.4f, %.4f, %.4f]", bone.inverse_bind_matrix[12], bone.inverse_bind_matrix[13], bone.inverse_bind_matrix[14], bone.inverse_bind_matrix[15]);
+            }
+        }
+    }
+
+    // Animations
+    {
+        CLOG_DEBUG(&LOG, "ANIMATIONS (%ld):", data.animations.size());
+        for (const auto& anim : data.animations)
+        {
+            CLOG_DEBUG(&LOG, "  animation: %s (armature=%s, %ld channels)", anim.name.c_str(), anim.armature_name.c_str(), anim.channels.size());
+            for (size_t i = 0; i < anim.channels.size(); i++)
+            {
+                const auto& channel  = anim.channels[i];
+                const char* type_str = channel.channel_type == anim_channel_type_t::LOCATION ? "location" : (channel.channel_type == anim_channel_type_t::ROTATION ? "rotation" : "scale");
+                CLOG_DEBUG(&LOG, "    channel[%zu]: bone=%u, type=%s, keyframes=%ld", i, channel.bone_index, type_str, channel.keyframe_times.size());
+                if (!channel.keyframe_times.is_empty())
+                {
+                    const auto& first_val = channel.keyframe_values.first();
+                    const auto& last_val  = channel.keyframe_values.last();
+                    CLOG_DEBUG(&LOG, "      first (t=%.3f): [%.4f, %.4f, %.4f, %.4f]", channel.keyframe_times.first(), first_val[0], first_val[1], first_val[2], first_val[3]);
+                    CLOG_DEBUG(&LOG, "      last  (t=%.3f): [%.4f, %.4f, %.4f, %.4f]", channel.keyframe_times.last(), last_val[0], last_val[1], last_val[2], last_val[3]);
+                }
+            }
+        }
+    }
+
+    CLOG_DEBUG(&LOG, "=== END DATA DUMP ===");
+}
+
+// =========================================================================================================================================
+// =========================================================================================================================================
+// =========================================================================================================================================
+// =========================================================================================================================================
+struct socket_endpoint_t
+{
+    std::string node_name;
+    std::string socket_id;
+};
+
+// =========================================================================================================================================
+// =========================================================================================================================================
+// =========================================================================================================================================
+// =========================================================================================================================================
+static void recurs_flatten_node_tree(bNodeTree* tree, const std::string& prefix, material_t& material_data, const std::map<std::string, socket_endpoint_t>& input_mappings, std::map<std::string, socket_endpoint_t>& output_mappings)
+{
+    if (tree == nullptr) return;
+
+    // Build reroute resolution map: traces through reroute chains to find actual source
+    // Maps reroute node name -> (source node, source socket)
+    std::map<std::string, std::pair<bNode*, bNodeSocket*>> reroute_sources;
+    {
+        // First, find what each reroute's input is directly connected to
+        std::map<std::string, std::pair<bNode*, bNodeSocket*>> direct_sources;
+        for (bNodeLink* link : blender::ListBaseWrapper<bNodeLink>(tree->links))
+        {
+            if (!link->fromnode || !link->tonode || !link->fromsock || !link->tosock) continue;
+            if (blender::StringRef(link->tonode->idname) == "NodeReroute")
+            {
+                direct_sources[link->tonode->name] = {link->fromnode, link->fromsock};
+            }
+        }
+
+        // Resolve chains: trace through reroutes to find the actual source
+        for (auto& [reroute_name, source] : direct_sources)
+        {
+            bNode* current_node       = source.first;
+            bNodeSocket* current_sock = source.second;
+            while (current_node && blender::StringRef(current_node->idname) == "NodeReroute")
+            {
+                auto it = direct_sources.find(current_node->name);
+                if (it == direct_sources.end()) break;
+                current_node = it->second.first;
+                current_sock = it->second.second;
+            }
+            reroute_sources[reroute_name] = {current_node, current_sock};
+        }
+    }
+
+    // Helper to resolve actual source (handles reroutes)
+    auto resolve_source = [&](bNode* from_node, bNodeSocket* from_sock) -> std::pair<bNode*, bNodeSocket*>
+    {
+        if (blender::StringRef(from_node->idname) == "NodeReroute")
+        {
+            auto it = reroute_sources.find(from_node->name);
+            if (it != reroute_sources.end())
+            {
+                return it->second;
+            }
+        }
+        return {from_node, from_sock};
+    };
+
+    // First pass: identify group nodes, build their io mappings, collect internal links for resolving group io
+    std::map<std::string, bNodeTree*> group_trees;
+    std::map<std::string, std::map<std::string, socket_endpoint_t>> group_input_maps;
+    std::map<std::string, std::map<std::string, socket_endpoint_t>> group_output_maps;
+    for (bNode* node : blender::ListBaseWrapper<bNode>(tree->nodes))
+    {
+        if (blender::StringRef(node->idname) != "ShaderNodeGroup" || node->id == nullptr)
+        {
+            continue;
+        }
+
+        bNodeTree* group_tree   = (bNodeTree*)node->id;
+        group_trees[node->name] = group_tree;
+
+        for (bNodeLink* link : blender::ListBaseWrapper<bNodeLink>(group_tree->links))
+        {
+            if (!link->fromnode || !link->tonode || !link->fromsock || !link->tosock) continue;
+            if (blender::StringRef(link->fromnode->idname) == "NodeGroupInput") group_input_maps[node->name][link->fromsock->identifier] = {prefix + node->name + "." + link->tonode->name, link->tosock->identifier};
+            if (blender::StringRef(link->tonode->idname) == "NodeGroupOutput") group_output_maps[node->name][link->tosock->identifier] = {prefix + node->name + "." + link->fromnode->name, link->fromsock->identifier};
+        }
+    }
+
+    // Second pass: process all nodes
+    for (bNode* node : blender::ListBaseWrapper<bNode>(tree->nodes))
+    {
+        if (blender::StringRef(node->idname) == "NodeGroupInput" || blender::StringRef(node->idname) == "NodeGroupOutput" || blender::StringRef(node->idname) == "NodeReroute")
+        {
+            continue;
+        }
+        else if (blender::StringRef(node->idname) == "ShaderNodeGroup" && node->id != nullptr)
+        {
+            std::map<std::string, socket_endpoint_t> nested_input_mappings;
+            for (bNodeLink* link : blender::ListBaseWrapper<bNodeLink>(tree->links))
+            {
+                if (link->tonode != node || !link->fromnode || !link->fromsock || !link->tosock)
+                {
+                    continue;
+                }
+
+                // Resolve through reroutes
+                auto [resolved_node, resolved_sock] = resolve_source(link->fromnode, link->fromsock);
+                if (!resolved_node) continue;
+
+                if (blender::StringRef(resolved_node->idname) == "ShaderNodeGroup")
+                {
+                    auto& src_output_map = group_output_maps[resolved_node->name];
+                    auto it              = src_output_map.find(resolved_sock->identifier);
+                    if (it != src_output_map.end())
+                    {
+                        nested_input_mappings[link->tosock->identifier] = it->second;
+                        continue;
+                    }
+                }
+                else if (blender::StringRef(resolved_node->idname) == "NodeGroupInput")
+                {
+                    auto it = input_mappings.find(resolved_sock->identifier);
+                    if (it != input_mappings.end())
+                    {
+                        nested_input_mappings[link->tosock->identifier] = it->second;
+                        continue;
+                    }
+                }
+
+                std::string from_node_name                      = prefix + resolved_node->name;
+                nested_input_mappings[link->tosock->identifier] = {from_node_name, resolved_sock->identifier};
+            }
+
+            // Recursively flatten the group
+            bNodeTree* group_tree    = (bNodeTree*)node->id;
+            std::string group_prefix = prefix + node->name + ".";
+            std::map<std::string, socket_endpoint_t> nested_output_mappings;
+            recurs_flatten_node_tree(group_tree, group_prefix, material_data, nested_input_mappings, nested_output_mappings);
+
+            // Store output mappings for link resolution
+            group_output_maps[node->name] = nested_output_mappings;
+        }
+        else
+        {
+            auto extract_default_value = [](bNodeSocket* socket) -> std::optional<socket_default_value_t>
+            {
+                if (socket->default_value == nullptr) return std::nullopt;
+
+                if (blender::StringRef(socket->idname).startswith("NodeSocketFloat"))
+                {
+                    auto* val = static_cast<bNodeSocketValueFloat*>(socket->default_value);
+                    return socket_value_float_t{val->value};
+                }
+                else if (blender::StringRef(socket->idname).startswith("NodeSocketInt"))
+                {
+                    auto* val = static_cast<bNodeSocketValueInt*>(socket->default_value);
+                    return socket_value_int_t{val->value};
+                }
+                else if (blender::StringRef(socket->idname) == "NodeSocketBool")
+                {
+                    auto* val = static_cast<bNodeSocketValueBoolean*>(socket->default_value);
+                    return socket_value_bool_t{val->value != 0};
+                }
+                else if (blender::StringRef(socket->idname).startswith("NodeSocketVector"))
+                {
+                    auto* val = static_cast<bNodeSocketValueVector*>(socket->default_value);
+                    return socket_value_vector_t{blender::float3(val->value[0], val->value[1], val->value[2])};
+                }
+                else if (blender::StringRef(socket->idname) == "NodeSocketColor")
+                {
+                    auto* val = static_cast<bNodeSocketValueRGBA*>(socket->default_value);
+                    return socket_value_rgba_t{blender::float4(val->value[0], val->value[1], val->value[2], val->value[3])};
+                }
+
+                return std::nullopt;
+            };
+
+            shader_node_t node_data;
+            node_data.name   = prefix + node->name;
+            node_data.idname = node->idname;
+
+            // Input sockets
+            for (bNodeSocket* socket : blender::ListBaseWrapper<bNodeSocket>(node->inputs))
+            {
+                shader_node_socket_t socket_data;
+                socket_data.identifier    = socket->identifier;
+                socket_data.idname        = socket->idname;
+                socket_data.default_value = extract_default_value(socket);
+                node_data.inputs.append(socket_data);
+            }
+
+            // Output sockets
+            for (bNodeSocket* socket : blender::ListBaseWrapper<bNodeSocket>(node->outputs))
+            {
+                shader_node_socket_t socket_data;
+                socket_data.identifier    = socket->identifier;
+                socket_data.idname        = socket->idname;
+                socket_data.default_value = extract_default_value(socket);
+                node_data.outputs.append(socket_data);
+            }
+
+            // Node properties
+            auto add_int_prop = [&](const char* id, int val)
+            {
+                shader_node_prop_t p;
+                p.identifier = id;
+                p.value      = socket_value_int_t{val};
+                node_data.props.append(p);
+            };
+            auto add_bool_prop = [&](const char* id, bool val)
+            {
+                shader_node_prop_t p;
+                p.identifier = id;
+                p.value      = socket_value_bool_t{val};
+                node_data.props.append(p);
+            };
+            auto add_float_prop = [&](const char* id, float val)
+            {
+                shader_node_prop_t p;
+                p.identifier = id;
+                p.value      = socket_value_float_t{val};
+                node_data.props.append(p);
+            };
+            auto add_tex_prop = [&](const char* id, const std::string& val)
+            {
+                shader_node_prop_t p;
+                p.identifier = id;
+                p.value      = socket_value_tex_t{val};
+                node_data.props.append(p);
+            };
+            auto add_uv_map_prop = [&](const char* id, const std::string& val)
+            {
+                shader_node_prop_t p;
+                p.identifier = id;
+                p.value      = socket_value_uv_map_t{val};
+                node_data.props.append(p);
+            };
+            auto add_rgba_prop = [&](const char* id, float r, float g, float b, float a)
+            {
+                shader_node_prop_t p;
+                p.identifier = id;
+                p.value      = socket_value_rgba_t{blender::float4(r, g, b, a)};
+                node_data.props.append(p);
+            };
+
+            if (blender::StringRef(node->idname) == "ShaderNodeUVMap")
+            {
+                NodeShaderUVMap* data = (NodeShaderUVMap*)node->storage;
+                if (data) add_uv_map_prop("uv_map", data->uv_map);
+            }
+            else if (blender::StringRef(node->idname) == "ShaderNodeMath")
+            {
+                add_int_prop("operation", node->custom1);
+                add_bool_prop("use_clamp", node->custom2 != 0);
+            }
+            else if (blender::StringRef(node->idname) == "ShaderNodeVectorMath")
+            {
+                add_int_prop("operation", node->custom1);
+            }
+            else if (blender::StringRef(node->idname) == "ShaderNodeMix")
+            {
+                NodeShaderMix* data = (NodeShaderMix*)node->storage;
+                if (data)
+                {
+                    add_int_prop("blend_type", data->blend_type);
+                    add_bool_prop("clamp_factor", data->clamp_factor != 0);
+                    add_bool_prop("clamp_result", data->clamp_result != 0);
+                    add_int_prop("data_type", data->data_type);
+                    add_int_prop("factor_mode", data->factor_mode);
+                }
+            }
+            else if (blender::StringRef(node->idname) == "ShaderNodeSeparateColor" || blender::StringRef(node->idname) == "ShaderNodeCombineColor")
+            {
+                NodeCombSepColor* data = (NodeCombSepColor*)node->storage;
+                if (data) add_int_prop("mode", data->mode);
+            }
+            else if (blender::StringRef(node->idname) == "ShaderNodeTexNoise")
+            {
+                NodeTexNoise* data = (NodeTexNoise*)node->storage;
+                if (data)
+                {
+                    add_int_prop("noise_dimensions", data->dimensions);
+                    add_int_prop("noise_type", data->type);
+                    add_bool_prop("normalize", data->normalize != 0);
+                }
+            }
+            else if (blender::StringRef(node->idname) == "ShaderNodeTexImage")
+            {
+                if (node->id != nullptr)
+                {
+                    Image* ima = (Image*)node->id;
+                    add_tex_prop("image", ima->id.name);
+                }
+                NodeTexImage* data = (NodeTexImage*)node->storage;
+                if (data)
+                {
+                    add_int_prop("interpolation", data->interpolation);
+                    add_int_prop("projection", data->projection);
+                    add_int_prop("extension", data->extension);
+                }
+            }
+            else if (blender::StringRef(node->idname) == "ShaderNodeValToRGB")
+            {
+                ColorBand* coba = (ColorBand*)node->storage;
+                if (coba)
+                {
+                    add_int_prop("interpolation", coba->ipotype);
+                    add_int_prop("element_count", coba->tot);
+                    for (int i = 0; i < coba->tot && i < 8; i++)
+                    {
+                        add_float_prop(("position_" + std::to_string(i)).c_str(), coba->data[i].pos);
+                        add_rgba_prop(("color_" + std::to_string(i)).c_str(), coba->data[i].r, coba->data[i].g, coba->data[i].b, coba->data[i].a);
+                    }
+                }
+            }
+            else if (blender::StringRef(node->idname) == "ShaderNodeAmbientOcclusion")
+            {
+                add_int_prop("samples", node->custom1);
+                add_bool_prop("inside", (node->custom2 & SHD_AO_INSIDE) != 0);
+                add_bool_prop("only_local", (node->custom2 & SHD_AO_LOCAL) != 0);
+            }
+            else if (blender::StringRef(node->idname) == "ShaderNodeBump")
+            {
+                add_bool_prop("invert", node->custom1 != 0);
+            }
+            else if (blender::StringRef(node->idname) == "ShaderNodeClamp")
+            {
+                add_int_prop("clamp_type", node->custom1);
+            }
+            else if (blender::StringRef(node->idname) == "ShaderNodeDisplacement")
+            {
+                add_int_prop("space", node->custom1);
+            }
+            else if (blender::StringRef(node->idname) == "ShaderNodeMapRange")
+            {
+                NodeMapRange* data = (NodeMapRange*)node->storage;
+                if (data)
+                {
+                    add_int_prop("data_type", data->data_type);
+                    add_int_prop("interpolation_type", data->interpolation_type);
+                    add_bool_prop("clamp", data->clamp != 0);
+                }
+            }
+            else if (blender::StringRef(node->idname) == "ShaderNodeMapping")
+            {
+                add_int_prop("vector_type", node->custom1);
+            }
+            else if (blender::StringRef(node->idname) == "ShaderNodeNormalMap")
+            {
+                NodeShaderNormalMap* data = (NodeShaderNormalMap*)node->storage;
+                if (data)
+                {
+                    add_int_prop("space", data->space);
+                    add_uv_map_prop("uv_map", data->uv_map);
+                }
+            }
+            else if (blender::StringRef(node->idname) == "ShaderNodeTangent")
+            {
+                NodeShaderTangent* data = (NodeShaderTangent*)node->storage;
+                if (data)
+                {
+                    add_int_prop("direction_type", data->direction_type);
+                    add_int_prop("axis", data->axis);
+                    add_uv_map_prop("uv_map", data->uv_map);
+                }
+            }
+            else if (blender::StringRef(node->idname) == "ShaderNodeTexBrick")
+            {
+                NodeTexBrick* data = (NodeTexBrick*)node->storage;
+                if (data)
+                {
+                    add_float_prop("offset", data->offset);
+                    add_int_prop("offset_frequency", data->offset_freq);
+                    add_float_prop("squash", data->squash);
+                    add_int_prop("squash_frequency", data->squash_freq);
+                }
+            }
+            else if (blender::StringRef(node->idname) == "ShaderNodeTexEnvironment")
+            {
+                if (node->id != nullptr)
+                {
+                    Image* ima = (Image*)node->id;
+                    add_tex_prop("image", ima->id.name);
+                }
+                NodeTexEnvironment* data = (NodeTexEnvironment*)node->storage;
+                if (data)
+                {
+                    add_int_prop("interpolation", data->interpolation);
+                    add_int_prop("projection", data->projection);
+                }
+            }
+            else if (blender::StringRef(node->idname) == "ShaderNodeTexGabor")
+            {
+                NodeTexGabor* data = (NodeTexGabor*)node->storage;
+                if (data)
+                {
+                    add_int_prop("gabor_type", data->type);
+                }
+            }
+            else if (blender::StringRef(node->idname) == "ShaderNodeTexGradient")
+            {
+                NodeTexGradient* data = (NodeTexGradient*)node->storage;
+                if (data)
+                {
+                    add_int_prop("gradient_type", data->gradient_type);
+                }
+            }
+            else if (blender::StringRef(node->idname) == "ShaderNodeTexMagic")
+            {
+                NodeTexMagic* data = (NodeTexMagic*)node->storage;
+                if (data)
+                {
+                    add_int_prop("turbulence_depth", data->depth);
+                }
+            }
+            else if (blender::StringRef(node->idname) == "ShaderNodeTexVoronoi")
+            {
+                NodeTexVoronoi* data = (NodeTexVoronoi*)node->storage;
+                if (data)
+                {
+                    add_int_prop("voronoi_dimensions", data->dimensions);
+                    add_int_prop("feature", data->feature);
+                    add_int_prop("distance", data->distance);
+                }
+            }
+            else if (blender::StringRef(node->idname) == "ShaderNodeTexWave")
+            {
+                NodeTexWave* data = (NodeTexWave*)node->storage;
+                if (data)
+                {
+                    add_int_prop("wave_type", data->wave_type);
+                    add_int_prop("bands_direction", data->bands_direction);
+                    add_int_prop("rings_direction", data->rings_direction);
+                    add_int_prop("wave_profile", data->wave_profile);
+                }
+            }
+            else if (blender::StringRef(node->idname) == "ShaderNodeTexWhiteNoise")
+            {
+                add_int_prop("noise_dimensions", node->custom1);
+            }
+            else if (blender::StringRef(node->idname) == "ShaderNodeVectorDisplacement")
+            {
+                add_int_prop("space", node->custom1);
+            }
+            else if (blender::StringRef(node->idname) == "ShaderNodeVectorRotate")
+            {
+                add_int_prop("rotation_type", node->custom1);
+                add_bool_prop("invert", node->custom2 != 0);
+            }
+            else if (blender::StringRef(node->idname) == "ShaderNodeVectorTransform")
+            {
+                NodeShaderVectTransform* data = (NodeShaderVectTransform*)node->storage;
+                if (data)
+                {
+                    add_int_prop("vector_type", data->type);
+                    add_int_prop("convert_from", data->convert_from);
+                    add_int_prop("convert_to", data->convert_to);
+                }
+            }
+
+            material_data.nodes.append(node_data);
+        }
+    }
+
+    // Third pass: process links and resolve group boundaries
+    for (bNodeLink* link : blender::ListBaseWrapper<bNodeLink>(tree->links))
+    {
+        if (!link->fromnode || !link->tonode || !link->fromsock || !link->tosock) continue;
+
+        if (blender::StringRef(link->fromnode->idname) == "NodeGroupInput") continue;
+
+        if (blender::StringRef(link->tonode->idname) == "NodeReroute") continue;
+
+        auto [resolved_node, resolved_sock] = resolve_source(link->fromnode, link->fromsock);
+        if (!resolved_node) continue;
+
+        if (blender::StringRef(link->tonode->idname) == "NodeGroupOutput")
+        {
+            std::string from_node_name = prefix + resolved_node->name;
+            std::string from_socket    = resolved_sock->identifier;
+
+            if (blender::StringRef(resolved_node->idname) == "ShaderNodeGroup")
+            {
+                auto& src_output_map = group_output_maps[resolved_node->name];
+                auto it              = src_output_map.find(resolved_sock->identifier);
+                if (it != src_output_map.end())
+                {
+                    from_node_name = it->second.node_name;
+                    from_socket    = it->second.socket_id;
+                }
+            }
+            else if (blender::StringRef(resolved_node->idname) == "NodeGroupInput")
+            {
+                // Handle GroupInput -> Reroute -> GroupOutput (pass-through)
+                auto it = input_mappings.find(resolved_sock->identifier);
+                if (it != input_mappings.end())
+                {
+                    from_node_name = it->second.node_name;
+                    from_socket    = it->second.socket_id;
+                }
+            }
+
+            output_mappings[link->tosock->identifier] = {from_node_name, from_socket};
+            continue;
+        }
+
+        if (blender::StringRef(link->tonode->idname) == "ShaderNodeGroup") continue;
+        if (blender::StringRef(resolved_node->idname) == "ShaderNodeGroup")
+        {
+            auto& src_output_map = group_output_maps[resolved_node->name];
+            auto it              = src_output_map.find(resolved_sock->identifier);
+            if (it != src_output_map.end())
+            {
+                shader_link_t link_data;
+                link_data.from_node   = it->second.node_name;
+                link_data.from_socket = it->second.socket_id;
+                link_data.to_node     = prefix + link->tonode->name;
+                link_data.to_socket   = link->tosock->identifier;
+                material_data.links.append(link_data);
+            }
+            continue;
+        }
+
+        // Handle case where reroute resolves back to GroupInput (GroupInput -> Reroute -> Node)
+        if (blender::StringRef(resolved_node->idname) == "NodeGroupInput")
+        {
+            auto it = input_mappings.find(resolved_sock->identifier);
+            if (it != input_mappings.end())
+            {
+                shader_link_t link_data;
+                link_data.from_node   = it->second.node_name;
+                link_data.from_socket = it->second.socket_id;
+                link_data.to_node     = prefix + link->tonode->name;
+                link_data.to_socket   = link->tosock->identifier;
+                material_data.links.append(link_data);
+            }
+            continue;
+        }
+
+        shader_link_t link_data;
+        link_data.from_node   = prefix + resolved_node->name;
+        link_data.from_socket = resolved_sock->identifier;
+        link_data.to_node     = prefix + link->tonode->name;
+        link_data.to_socket   = link->tosock->identifier;
+        material_data.links.append(link_data);
+    }
+
+    // Fourth pass: add links from input mappings for nodes that read from GroupInput
+    for (bNodeLink* link : blender::ListBaseWrapper<bNodeLink>(tree->links))
+    {
+        if (!link->fromnode || !link->tonode || !link->fromsock || !link->tosock) continue;
+
+        if (blender::StringRef(link->tonode->idname) == "NodeReroute") continue;
+
+        if (blender::StringRef(link->fromnode->idname) == "NodeGroupInput" && blender::StringRef(link->tonode->idname) != "NodeGroupOutput" && blender::StringRef(link->tonode->idname) != "ShaderNodeGroup")
+        {
+            auto it = input_mappings.find(link->fromsock->identifier);
+            if (it != input_mappings.end())
+            {
+                shader_link_t link_data;
+                link_data.from_node   = it->second.node_name;
+                link_data.from_socket = it->second.socket_id;
+                link_data.to_node     = prefix + link->tonode->name;
+                link_data.to_socket   = link->tosock->identifier;
+                material_data.links.append(link_data);
+            }
+        }
+    }
 }
 
 // =========================================================================================================================================
@@ -280,567 +1022,6 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
     // ===============================================================================================
     // ===============================================================================================
     {
-        struct socket_endpoint_t
-        {
-            std::string node_name;
-            std::string socket_id;
-        };
-
-        std::function<void(bNodeTree * tree, const std::string& prefix, material_t& material_data, const std::map<std::string, socket_endpoint_t>& input_mappings, std::map<std::string, socket_endpoint_t>& output_mappings)> flatten_node_tree;
-        flatten_node_tree = [&flatten_node_tree](bNodeTree* tree, const std::string& prefix, material_t& material_data, const std::map<std::string, socket_endpoint_t>& input_mappings, std::map<std::string, socket_endpoint_t>& output_mappings)
-        {
-            if (tree == nullptr) return;
-
-            // Build reroute resolution map: traces through reroute chains to find actual source
-            // Maps reroute node name -> (source node, source socket)
-            std::map<std::string, std::pair<bNode*, bNodeSocket*>> reroute_sources;
-            {
-                // First, find what each reroute's input is directly connected to
-                std::map<std::string, std::pair<bNode*, bNodeSocket*>> direct_sources;
-                for (bNodeLink* link : blender::ListBaseWrapper<bNodeLink>(tree->links))
-                {
-                    if (!link->fromnode || !link->tonode || !link->fromsock || !link->tosock) continue;
-                    if (blender::StringRef(link->tonode->idname) == "NodeReroute")
-                    {
-                        direct_sources[link->tonode->name] = {link->fromnode, link->fromsock};
-                    }
-                }
-
-                // Resolve chains: trace through reroutes to find the actual source
-                for (auto& [reroute_name, source] : direct_sources)
-                {
-                    bNode* current_node       = source.first;
-                    bNodeSocket* current_sock = source.second;
-                    while (current_node && blender::StringRef(current_node->idname) == "NodeReroute")
-                    {
-                        auto it = direct_sources.find(current_node->name);
-                        if (it == direct_sources.end()) break;
-                        current_node = it->second.first;
-                        current_sock = it->second.second;
-                    }
-                    reroute_sources[reroute_name] = {current_node, current_sock};
-                }
-            }
-
-            // Helper to resolve actual source (handles reroutes)
-            auto resolve_source = [&](bNode* from_node, bNodeSocket* from_sock) -> std::pair<bNode*, bNodeSocket*>
-            {
-                if (blender::StringRef(from_node->idname) == "NodeReroute")
-                {
-                    auto it = reroute_sources.find(from_node->name);
-                    if (it != reroute_sources.end())
-                    {
-                        return it->second;
-                    }
-                }
-                return {from_node, from_sock};
-            };
-
-            // First pass: identify group nodes, build their io mappings, collect internal links for resolving group io
-            std::map<std::string, bNodeTree*> group_trees;
-            std::map<std::string, std::map<std::string, socket_endpoint_t>> group_input_maps;
-            std::map<std::string, std::map<std::string, socket_endpoint_t>> group_output_maps;
-            for (bNode* node : blender::ListBaseWrapper<bNode>(tree->nodes))
-            {
-                if (blender::StringRef(node->idname) != "ShaderNodeGroup" || node->id == nullptr)
-                {
-                    continue;
-                }
-
-                bNodeTree* group_tree   = (bNodeTree*)node->id;
-                group_trees[node->name] = group_tree;
-
-                for (bNodeLink* link : blender::ListBaseWrapper<bNodeLink>(group_tree->links))
-                {
-                    if (!link->fromnode || !link->tonode || !link->fromsock || !link->tosock) continue;
-                    if (blender::StringRef(link->fromnode->idname) == "NodeGroupInput") group_input_maps[node->name][link->fromsock->identifier] = {prefix + node->name + "." + link->tonode->name, link->tosock->identifier};
-                    if (blender::StringRef(link->tonode->idname) == "NodeGroupOutput") group_output_maps[node->name][link->tosock->identifier] = {prefix + node->name + "." + link->fromnode->name, link->fromsock->identifier};
-                }
-            }
-
-            // Second pass: process all nodes
-            for (bNode* node : blender::ListBaseWrapper<bNode>(tree->nodes))
-            {
-                if (blender::StringRef(node->idname) == "NodeGroupInput" || blender::StringRef(node->idname) == "NodeGroupOutput" || blender::StringRef(node->idname) == "NodeReroute")
-                {
-                    continue;
-                }
-                else if (blender::StringRef(node->idname) == "ShaderNodeGroup" && node->id != nullptr)
-                {
-                    std::map<std::string, socket_endpoint_t> nested_input_mappings;
-                    for (bNodeLink* link : blender::ListBaseWrapper<bNodeLink>(tree->links))
-                    {
-                        if (link->tonode != node || !link->fromnode || !link->fromsock || !link->tosock)
-                        {
-                            continue;
-                        }
-
-                        // Resolve through reroutes
-                        auto [resolved_node, resolved_sock] = resolve_source(link->fromnode, link->fromsock);
-                        if (!resolved_node) continue;
-
-                        if (blender::StringRef(resolved_node->idname) == "ShaderNodeGroup")
-                        {
-                            auto& src_output_map = group_output_maps[resolved_node->name];
-                            auto it              = src_output_map.find(resolved_sock->identifier);
-                            if (it != src_output_map.end())
-                            {
-                                nested_input_mappings[link->tosock->identifier] = it->second;
-                                continue;
-                            }
-                        }
-                        else if (blender::StringRef(resolved_node->idname) == "NodeGroupInput")
-                        {
-                            auto it = input_mappings.find(resolved_sock->identifier);
-                            if (it != input_mappings.end())
-                            {
-                                nested_input_mappings[link->tosock->identifier] = it->second;
-                                continue;
-                            }
-                        }
-
-                        std::string from_node_name                      = prefix + resolved_node->name;
-                        nested_input_mappings[link->tosock->identifier] = {from_node_name, resolved_sock->identifier};
-                    }
-
-                    // Recursively flatten the group
-                    bNodeTree* group_tree    = (bNodeTree*)node->id;
-                    std::string group_prefix = prefix + node->name + ".";
-                    std::map<std::string, socket_endpoint_t> nested_output_mappings;
-                    flatten_node_tree(group_tree, group_prefix, material_data, nested_input_mappings, nested_output_mappings);
-
-                    // Store output mappings for link resolution
-                    group_output_maps[node->name] = nested_output_mappings;
-                }
-                else
-                {
-                    auto extract_default_value = [](bNodeSocket* socket) -> std::optional<socket_default_value_t>
-                    {
-                        if (socket->default_value == nullptr) return std::nullopt;
-
-                        if (blender::StringRef(socket->idname).startswith("NodeSocketFloat"))
-                        {
-                            auto* val = static_cast<bNodeSocketValueFloat*>(socket->default_value);
-                            return socket_value_float_t{val->value};
-                        }
-                        else if (blender::StringRef(socket->idname).startswith("NodeSocketInt"))
-                        {
-                            auto* val = static_cast<bNodeSocketValueInt*>(socket->default_value);
-                            return socket_value_int_t{val->value};
-                        }
-                        else if (blender::StringRef(socket->idname) == "NodeSocketBool")
-                        {
-                            auto* val = static_cast<bNodeSocketValueBoolean*>(socket->default_value);
-                            return socket_value_bool_t{val->value != 0};
-                        }
-                        else if (blender::StringRef(socket->idname).startswith("NodeSocketVector"))
-                        {
-                            auto* val = static_cast<bNodeSocketValueVector*>(socket->default_value);
-                            return socket_value_vector_t{blender::float3(val->value[0], val->value[1], val->value[2])};
-                        }
-                        else if (blender::StringRef(socket->idname) == "NodeSocketColor")
-                        {
-                            auto* val = static_cast<bNodeSocketValueRGBA*>(socket->default_value);
-                            return socket_value_rgba_t{blender::float4(val->value[0], val->value[1], val->value[2], val->value[3])};
-                        }
-
-                        return std::nullopt;
-                    };
-
-                    shader_node_t node_data;
-                    node_data.name   = prefix + node->name;
-                    node_data.idname = node->idname;
-
-                    // Input sockets
-                    for (bNodeSocket* socket : blender::ListBaseWrapper<bNodeSocket>(node->inputs))
-                    {
-                        shader_node_socket_t socket_data;
-                        socket_data.identifier    = socket->identifier;
-                        socket_data.idname        = socket->idname;
-                        socket_data.default_value = extract_default_value(socket);
-                        node_data.inputs.append(socket_data);
-                    }
-
-                    // Output sockets
-                    for (bNodeSocket* socket : blender::ListBaseWrapper<bNodeSocket>(node->outputs))
-                    {
-                        shader_node_socket_t socket_data;
-                        socket_data.identifier    = socket->identifier;
-                        socket_data.idname        = socket->idname;
-                        socket_data.default_value = extract_default_value(socket);
-                        node_data.outputs.append(socket_data);
-                    }
-
-                    // Node properties
-                    auto add_int_prop = [&](const char* id, int val)
-                    {
-                        shader_node_prop_t p;
-                        p.identifier = id;
-                        p.value      = socket_value_int_t{val};
-                        node_data.props.append(p);
-                    };
-                    auto add_bool_prop = [&](const char* id, bool val)
-                    {
-                        shader_node_prop_t p;
-                        p.identifier = id;
-                        p.value      = socket_value_bool_t{val};
-                        node_data.props.append(p);
-                    };
-                    auto add_float_prop = [&](const char* id, float val)
-                    {
-                        shader_node_prop_t p;
-                        p.identifier = id;
-                        p.value      = socket_value_float_t{val};
-                        node_data.props.append(p);
-                    };
-                    auto add_tex_prop = [&](const char* id, const std::string& val)
-                    {
-                        shader_node_prop_t p;
-                        p.identifier = id;
-                        p.value      = socket_value_tex_t{val};
-                        node_data.props.append(p);
-                    };
-                    auto add_uv_map_prop = [&](const char* id, const std::string& val)
-                    {
-                        shader_node_prop_t p;
-                        p.identifier = id;
-                        p.value      = socket_value_uv_map_t{val};
-                        node_data.props.append(p);
-                    };
-                    auto add_rgba_prop = [&](const char* id, float r, float g, float b, float a)
-                    {
-                        shader_node_prop_t p;
-                        p.identifier = id;
-                        p.value      = socket_value_rgba_t{blender::float4(r, g, b, a)};
-                        node_data.props.append(p);
-                    };
-
-                    if (blender::StringRef(node->idname) == "ShaderNodeUVMap")
-                    {
-                        NodeShaderUVMap* data = (NodeShaderUVMap*)node->storage;
-                        if (data) add_uv_map_prop("uv_map", data->uv_map);
-                    }
-                    else if (blender::StringRef(node->idname) == "ShaderNodeMath")
-                    {
-                        add_int_prop("operation", node->custom1);
-                        add_bool_prop("use_clamp", node->custom2 != 0);
-                    }
-                    else if (blender::StringRef(node->idname) == "ShaderNodeVectorMath")
-                    {
-                        add_int_prop("operation", node->custom1);
-                    }
-                    else if (blender::StringRef(node->idname) == "ShaderNodeMix")
-                    {
-                        NodeShaderMix* data = (NodeShaderMix*)node->storage;
-                        if (data)
-                        {
-                            add_int_prop("blend_type", data->blend_type);
-                            add_bool_prop("clamp_factor", data->clamp_factor != 0);
-                            add_bool_prop("clamp_result", data->clamp_result != 0);
-                            add_int_prop("data_type", data->data_type);
-                            add_int_prop("factor_mode", data->factor_mode);
-                        }
-                    }
-                    else if (blender::StringRef(node->idname) == "ShaderNodeSeparateColor" || blender::StringRef(node->idname) == "ShaderNodeCombineColor")
-                    {
-                        NodeCombSepColor* data = (NodeCombSepColor*)node->storage;
-                        if (data) add_int_prop("mode", data->mode);
-                    }
-                    else if (blender::StringRef(node->idname) == "ShaderNodeTexNoise")
-                    {
-                        NodeTexNoise* data = (NodeTexNoise*)node->storage;
-                        if (data)
-                        {
-                            add_int_prop("noise_dimensions", data->dimensions);
-                            add_int_prop("noise_type", data->type);
-                            add_bool_prop("normalize", data->normalize != 0);
-                        }
-                    }
-                    else if (blender::StringRef(node->idname) == "ShaderNodeTexImage")
-                    {
-                        if (node->id != nullptr)
-                        {
-                            Image* ima = (Image*)node->id;
-                            add_tex_prop("image", ima->id.name);
-                        }
-                        NodeTexImage* data = (NodeTexImage*)node->storage;
-                        if (data)
-                        {
-                            add_int_prop("interpolation", data->interpolation);
-                            add_int_prop("projection", data->projection);
-                            add_int_prop("extension", data->extension);
-                        }
-                    }
-                    else if (blender::StringRef(node->idname) == "ShaderNodeValToRGB")
-                    {
-                        ColorBand* coba = (ColorBand*)node->storage;
-                        if (coba)
-                        {
-                            add_int_prop("interpolation", coba->ipotype);
-                            add_int_prop("element_count", coba->tot);
-                            for (int i = 0; i < coba->tot && i < 8; i++)
-                            {
-                                add_float_prop(("position_" + std::to_string(i)).c_str(), coba->data[i].pos);
-                                add_rgba_prop(("color_" + std::to_string(i)).c_str(), coba->data[i].r, coba->data[i].g, coba->data[i].b, coba->data[i].a);
-                            }
-                        }
-                    }
-                    else if (blender::StringRef(node->idname) == "ShaderNodeAmbientOcclusion")
-                    {
-                        add_int_prop("samples", node->custom1);
-                        add_bool_prop("inside", (node->custom2 & SHD_AO_INSIDE) != 0);
-                        add_bool_prop("only_local", (node->custom2 & SHD_AO_LOCAL) != 0);
-                    }
-                    else if (blender::StringRef(node->idname) == "ShaderNodeBump")
-                    {
-                        add_bool_prop("invert", node->custom1 != 0);
-                    }
-                    else if (blender::StringRef(node->idname) == "ShaderNodeClamp")
-                    {
-                        add_int_prop("clamp_type", node->custom1);
-                    }
-                    else if (blender::StringRef(node->idname) == "ShaderNodeDisplacement")
-                    {
-                        add_int_prop("space", node->custom1);
-                    }
-                    else if (blender::StringRef(node->idname) == "ShaderNodeMapRange")
-                    {
-                        NodeMapRange* data = (NodeMapRange*)node->storage;
-                        if (data)
-                        {
-                            add_int_prop("data_type", data->data_type);
-                            add_int_prop("interpolation_type", data->interpolation_type);
-                            add_bool_prop("clamp", data->clamp != 0);
-                        }
-                    }
-                    else if (blender::StringRef(node->idname) == "ShaderNodeMapping")
-                    {
-                        add_int_prop("vector_type", node->custom1);
-                    }
-                    else if (blender::StringRef(node->idname) == "ShaderNodeNormalMap")
-                    {
-                        NodeShaderNormalMap* data = (NodeShaderNormalMap*)node->storage;
-                        if (data)
-                        {
-                            add_int_prop("space", data->space);
-                            add_uv_map_prop("uv_map", data->uv_map);
-                        }
-                    }
-                    else if (blender::StringRef(node->idname) == "ShaderNodeTangent")
-                    {
-                        NodeShaderTangent* data = (NodeShaderTangent*)node->storage;
-                        if (data)
-                        {
-                            add_int_prop("direction_type", data->direction_type);
-                            add_int_prop("axis", data->axis);
-                            add_uv_map_prop("uv_map", data->uv_map);
-                        }
-                    }
-                    else if (blender::StringRef(node->idname) == "ShaderNodeTexBrick")
-                    {
-                        NodeTexBrick* data = (NodeTexBrick*)node->storage;
-                        if (data)
-                        {
-                            add_float_prop("offset", data->offset);
-                            add_int_prop("offset_frequency", data->offset_freq);
-                            add_float_prop("squash", data->squash);
-                            add_int_prop("squash_frequency", data->squash_freq);
-                        }
-                    }
-                    else if (blender::StringRef(node->idname) == "ShaderNodeTexEnvironment")
-                    {
-                        if (node->id != nullptr)
-                        {
-                            Image* ima = (Image*)node->id;
-                            add_tex_prop("image", ima->id.name);
-                        }
-                        NodeTexEnvironment* data = (NodeTexEnvironment*)node->storage;
-                        if (data)
-                        {
-                            add_int_prop("interpolation", data->interpolation);
-                            add_int_prop("projection", data->projection);
-                        }
-                    }
-                    else if (blender::StringRef(node->idname) == "ShaderNodeTexGabor")
-                    {
-                        NodeTexGabor* data = (NodeTexGabor*)node->storage;
-                        if (data)
-                        {
-                            add_int_prop("gabor_type", data->type);
-                        }
-                    }
-                    else if (blender::StringRef(node->idname) == "ShaderNodeTexGradient")
-                    {
-                        NodeTexGradient* data = (NodeTexGradient*)node->storage;
-                        if (data)
-                        {
-                            add_int_prop("gradient_type", data->gradient_type);
-                        }
-                    }
-                    else if (blender::StringRef(node->idname) == "ShaderNodeTexMagic")
-                    {
-                        NodeTexMagic* data = (NodeTexMagic*)node->storage;
-                        if (data)
-                        {
-                            add_int_prop("turbulence_depth", data->depth);
-                        }
-                    }
-                    else if (blender::StringRef(node->idname) == "ShaderNodeTexVoronoi")
-                    {
-                        NodeTexVoronoi* data = (NodeTexVoronoi*)node->storage;
-                        if (data)
-                        {
-                            add_int_prop("voronoi_dimensions", data->dimensions);
-                            add_int_prop("feature", data->feature);
-                            add_int_prop("distance", data->distance);
-                        }
-                    }
-                    else if (blender::StringRef(node->idname) == "ShaderNodeTexWave")
-                    {
-                        NodeTexWave* data = (NodeTexWave*)node->storage;
-                        if (data)
-                        {
-                            add_int_prop("wave_type", data->wave_type);
-                            add_int_prop("bands_direction", data->bands_direction);
-                            add_int_prop("rings_direction", data->rings_direction);
-                            add_int_prop("wave_profile", data->wave_profile);
-                        }
-                    }
-                    else if (blender::StringRef(node->idname) == "ShaderNodeTexWhiteNoise")
-                    {
-                        add_int_prop("noise_dimensions", node->custom1);
-                    }
-                    else if (blender::StringRef(node->idname) == "ShaderNodeVectorDisplacement")
-                    {
-                        add_int_prop("space", node->custom1);
-                    }
-                    else if (blender::StringRef(node->idname) == "ShaderNodeVectorRotate")
-                    {
-                        add_int_prop("rotation_type", node->custom1);
-                        add_bool_prop("invert", node->custom2 != 0);
-                    }
-                    else if (blender::StringRef(node->idname) == "ShaderNodeVectorTransform")
-                    {
-                        NodeShaderVectTransform* data = (NodeShaderVectTransform*)node->storage;
-                        if (data)
-                        {
-                            add_int_prop("vector_type", data->type);
-                            add_int_prop("convert_from", data->convert_from);
-                            add_int_prop("convert_to", data->convert_to);
-                        }
-                    }
-
-                    material_data.nodes.append(node_data);
-                }
-            }
-
-            // Third pass: process links and resolve group boundaries
-            for (bNodeLink* link : blender::ListBaseWrapper<bNodeLink>(tree->links))
-            {
-                if (!link->fromnode || !link->tonode || !link->fromsock || !link->tosock) continue;
-
-                if (blender::StringRef(link->fromnode->idname) == "NodeGroupInput") continue;
-
-                if (blender::StringRef(link->tonode->idname) == "NodeReroute") continue;
-
-                auto [resolved_node, resolved_sock] = resolve_source(link->fromnode, link->fromsock);
-                if (!resolved_node) continue;
-
-                if (blender::StringRef(link->tonode->idname) == "NodeGroupOutput")
-                {
-                    std::string from_node_name = prefix + resolved_node->name;
-                    std::string from_socket    = resolved_sock->identifier;
-
-                    if (blender::StringRef(resolved_node->idname) == "ShaderNodeGroup")
-                    {
-                        auto& src_output_map = group_output_maps[resolved_node->name];
-                        auto it              = src_output_map.find(resolved_sock->identifier);
-                        if (it != src_output_map.end())
-                        {
-                            from_node_name = it->second.node_name;
-                            from_socket    = it->second.socket_id;
-                        }
-                    }
-                    else if (blender::StringRef(resolved_node->idname) == "NodeGroupInput")
-                    {
-                        // Handle GroupInput -> Reroute -> GroupOutput (pass-through)
-                        auto it = input_mappings.find(resolved_sock->identifier);
-                        if (it != input_mappings.end())
-                        {
-                            from_node_name = it->second.node_name;
-                            from_socket    = it->second.socket_id;
-                        }
-                    }
-
-                    output_mappings[link->tosock->identifier] = {from_node_name, from_socket};
-                    continue;
-                }
-
-                if (blender::StringRef(link->tonode->idname) == "ShaderNodeGroup") continue;
-                if (blender::StringRef(resolved_node->idname) == "ShaderNodeGroup")
-                {
-                    auto& src_output_map = group_output_maps[resolved_node->name];
-                    auto it              = src_output_map.find(resolved_sock->identifier);
-                    if (it != src_output_map.end())
-                    {
-                        shader_link_t link_data;
-                        link_data.from_node   = it->second.node_name;
-                        link_data.from_socket = it->second.socket_id;
-                        link_data.to_node     = prefix + link->tonode->name;
-                        link_data.to_socket   = link->tosock->identifier;
-                        material_data.links.append(link_data);
-                    }
-                    continue;
-                }
-
-                // Handle case where reroute resolves back to GroupInput (GroupInput -> Reroute -> Node)
-                if (blender::StringRef(resolved_node->idname) == "NodeGroupInput")
-                {
-                    auto it = input_mappings.find(resolved_sock->identifier);
-                    if (it != input_mappings.end())
-                    {
-                        shader_link_t link_data;
-                        link_data.from_node   = it->second.node_name;
-                        link_data.from_socket = it->second.socket_id;
-                        link_data.to_node     = prefix + link->tonode->name;
-                        link_data.to_socket   = link->tosock->identifier;
-                        material_data.links.append(link_data);
-                    }
-                    continue;
-                }
-
-                shader_link_t link_data;
-                link_data.from_node   = prefix + resolved_node->name;
-                link_data.from_socket = resolved_sock->identifier;
-                link_data.to_node     = prefix + link->tonode->name;
-                link_data.to_socket   = link->tosock->identifier;
-                material_data.links.append(link_data);
-            }
-
-            // Fourth pass: add links from input mappings for nodes that read from GroupInput
-            for (bNodeLink* link : blender::ListBaseWrapper<bNodeLink>(tree->links))
-            {
-                if (!link->fromnode || !link->tonode || !link->fromsock || !link->tosock) continue;
-
-                if (blender::StringRef(link->tonode->idname) == "NodeReroute") continue;
-
-                if (blender::StringRef(link->fromnode->idname) == "NodeGroupInput" && blender::StringRef(link->tonode->idname) != "NodeGroupOutput" && blender::StringRef(link->tonode->idname) != "ShaderNodeGroup")
-                {
-                    auto it = input_mappings.find(link->fromsock->identifier);
-                    if (it != input_mappings.end())
-                    {
-                        shader_link_t link_data;
-                        link_data.from_node   = it->second.node_name;
-                        link_data.from_socket = it->second.socket_id;
-                        link_data.to_node     = prefix + link->tonode->name;
-                        link_data.to_socket   = link->tosock->identifier;
-                        material_data.links.append(link_data);
-                    }
-                }
-            }
-        };
-
-        // Process each material
         LISTBASE_FOREACH(Material*, mat, &bmain->materials)
         {
             if (mat->nodetree == nullptr) continue;
@@ -853,7 +1034,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
                 std::map<std::string, socket_endpoint_t> input_mappings;
                 std::map<std::string, socket_endpoint_t> output_mappings;
 
-                flatten_node_tree(mat->nodetree, "", material_data, input_mappings, output_mappings);
+                recurs_flatten_node_tree(mat->nodetree, "", material_data, input_mappings, output_mappings);
             }
 
             // Find Principled BSDF node, skip material if not found
@@ -1941,162 +2122,7 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
     // ===============================================================================================
     // ===============================================================================================
     {
-        CLOG_DEBUG(&LOG, "=== DATA DUMP ===");
-
-        // Scenes
-        CLOG_DEBUG(&LOG, "SCENES (%ld):", data.scenes.size());
-        for (const auto& scene : data.scenes)
-        {
-            CLOG_DEBUG(&LOG, "  scene: %s", scene.name.c_str());
-            for (const auto& [elem_name, elem] : scene.elems)
-            {
-                CLOG_DEBUG(&LOG, "    elem: %s", elem.name.c_str());
-                if (elem.parent_name.has_value())
-                {
-                    CLOG_DEBUG(&LOG, "      parent: %s", elem.parent_name.value().c_str());
-                }
-                CLOG_DEBUG(&LOG, "      pos: (%.3f, %.3f, %.3f)", elem.pos.x, elem.pos.y, elem.pos.z);
-                CLOG_DEBUG(&LOG, "      rot: (%.3f, %.3f, %.3f)", elem.euler_rot.x, elem.euler_rot.y, elem.euler_rot.z);
-                CLOG_DEBUG(&LOG, "      scale: (%.3f, %.3f, %.3f)", elem.scale.x, elem.scale.y, elem.scale.z);
-                if (elem.mesh_name.has_value())
-                {
-                    CLOG_DEBUG(&LOG, "      mesh: %s", elem.mesh_name.value().c_str());
-                }
-                if (elem.skel_name.has_value())
-                {
-                    CLOG_DEBUG(&LOG, "      skel: %s", elem.skel_name.value().c_str());
-                }
-            }
-        }
-
-        // Meshes
-        CLOG_DEBUG(&LOG, "MESHES (%zu):", data.meshes.size());
-        for (const auto& [mesh_name, mesh] : data.meshes)
-        {
-            size_t total_tris = 0;
-            for (const auto& submesh : mesh.submeshes)
-            {
-                total_tris += submesh.triangles.size();
-            }
-            CLOG_DEBUG(&LOG, "  mesh: %s (%ld submeshes, %zu triangles)", mesh.name.c_str(), mesh.submeshes.size(), total_tris);
-            for (size_t i = 0; i < mesh.submeshes.size(); i++)
-            {
-                const auto& submesh = mesh.submeshes[i];
-                CLOG_DEBUG(&LOG, "    submesh[%zu]: material=%s, tris=%ld", i, submesh.material_name.c_str(), submesh.triangles.size());
-            }
-        }
-
-        // Images
-        CLOG_DEBUG(&LOG, "IMAGES (%zu):", data.images.size());
-        for (const auto& [image_name, image] : data.images)
-        {
-            CLOG_DEBUG(&LOG, "  image: %s (%ux%u, srgb=%s, %ld bytes)", image.name.c_str(), image.width, image.height, image.is_srgb ? "true" : "false", image.rgba_data.size());
-        }
-
-        // Materials
-        CLOG_DEBUG(&LOG, "MATERIALS (%zu):", data.materials.size());
-        for (const auto& [mat_name, mat] : data.materials)
-        {
-            CLOG_DEBUG(&LOG, "  material: %s (%ld nodes, %ld links)", mat.name.c_str(), mat.nodes.size(), mat.links.size());
-            for (size_t i = 0; i < mat.nodes.size(); i++)
-            {
-                const auto& node = mat.nodes[i];
-                CLOG_DEBUG(&LOG, "    node[%zu]: %s [%s] (inputs=%ld, outputs=%ld, props=%ld)", i, node.name.c_str(), node.idname.c_str(), node.inputs.size(), node.outputs.size(), node.props.size());
-                auto format_default_value = [](const std::optional<socket_default_value_t>& val) -> std::string
-                {
-                    if (!val.has_value()) return "";
-                    return std::visit(
-                        [](auto&& v) -> std::string
-                        {
-                            using T = std::decay_t<decltype(v)>;
-                            if constexpr (std::is_same_v<T, socket_value_float_t>) return " = " + std::to_string(v.value);
-                            else if constexpr (std::is_same_v<T, socket_value_int_t>) return " = " + std::to_string(v.value);
-                            else if constexpr (std::is_same_v<T, socket_value_bool_t>) return std::string(" = ") + (v.value ? "true" : "false");
-                            else if constexpr (std::is_same_v<T, socket_value_vector_t>) return " = (" + std::to_string(v.value.x) + ", " + std::to_string(v.value.y) + ", " + std::to_string(v.value.z) + ")";
-                            else if constexpr (std::is_same_v<T, socket_value_rgba_t>) return " = (" + std::to_string(v.value.x) + ", " + std::to_string(v.value.y) + ", " + std::to_string(v.value.z) + ", " + std::to_string(v.value.w) + ")";
-                            else if constexpr (std::is_same_v<T, socket_value_tex_t>) return " = \"" + v.value + "\"";
-                            else if constexpr (std::is_same_v<T, socket_value_uv_map_t>) return " = \"" + v.value + "\"";
-                            else return "";
-                        },
-                        val.value()
-                    );
-                };
-                for (const auto& input : node.inputs)
-                {
-                    CLOG_DEBUG(&LOG, "      in: %s (%s)%s", input.identifier.c_str(), input.idname.c_str(), format_default_value(input.default_value).c_str());
-                }
-                for (const auto& output : node.outputs)
-                {
-                    CLOG_DEBUG(&LOG, "      out: %s (%s)%s", output.identifier.c_str(), output.idname.c_str(), format_default_value(output.default_value).c_str());
-                }
-                for (const auto& prop : node.props)
-                {
-                    std::string value_str = std::visit(
-                        [](auto&& v) -> std::string
-                        {
-                            using T = std::decay_t<decltype(v)>;
-                            if constexpr (std::is_same_v<T, socket_value_float_t>) return std::to_string(v.value);
-                            else if constexpr (std::is_same_v<T, socket_value_int_t>) return std::to_string(v.value);
-                            else if constexpr (std::is_same_v<T, socket_value_bool_t>) return v.value ? "true" : "false";
-                            else if constexpr (std::is_same_v<T, socket_value_vector_t>) return "(" + std::to_string(v.value.x) + ", " + std::to_string(v.value.y) + ", " + std::to_string(v.value.z) + ")";
-                            else if constexpr (std::is_same_v<T, socket_value_rgba_t>) return "(" + std::to_string(v.value.x) + ", " + std::to_string(v.value.y) + ", " + std::to_string(v.value.z) + ", " + std::to_string(v.value.w) + ")";
-                            else if constexpr (std::is_same_v<T, socket_value_tex_t>) return "\"" + v.value + "\"";
-                            else if constexpr (std::is_same_v<T, socket_value_uv_map_t>) return "\"" + v.value + "\"";
-                            else return "";
-                        },
-                        prop.value
-                    );
-                    CLOG_DEBUG(&LOG, "      prop: %s = %s", prop.identifier.c_str(), value_str.c_str());
-                }
-            }
-            for (const auto& link : mat.links)
-            {
-                CLOG_DEBUG(&LOG, "    link: %s.%s -> %s.%s", link.from_node.c_str(), link.from_socket.c_str(), link.to_node.c_str(), link.to_socket.c_str());
-            }
-        }
-
-        // Skeletons
-        CLOG_DEBUG(&LOG, "SKELETONS (%zu):", data.skeletons.size());
-        for (const auto& [skel_name, skel] : data.skeletons)
-        {
-            CLOG_DEBUG(&LOG, "  skeleton: %s (%ld bones)", skel.name.c_str(), skel.bones.size());
-            for (size_t i = 0; i < skel.bones.size(); i++)
-            {
-                const auto& bone = skel.bones[i];
-                CLOG_DEBUG(&LOG, "    bone[%zu]: %s (parent=%d)", i, bone.name.c_str(), bone.parent_index);
-                CLOG_DEBUG(&LOG, "      bind_local: [%.4f, %.4f, %.4f, %.4f]", bone.bind_local_matrix[0], bone.bind_local_matrix[1], bone.bind_local_matrix[2], bone.bind_local_matrix[3]);
-                CLOG_DEBUG(&LOG, "                  [%.4f, %.4f, %.4f, %.4f]", bone.bind_local_matrix[4], bone.bind_local_matrix[5], bone.bind_local_matrix[6], bone.bind_local_matrix[7]);
-                CLOG_DEBUG(&LOG, "                  [%.4f, %.4f, %.4f, %.4f]", bone.bind_local_matrix[8], bone.bind_local_matrix[9], bone.bind_local_matrix[10], bone.bind_local_matrix[11]);
-                CLOG_DEBUG(&LOG, "                  [%.4f, %.4f, %.4f, %.4f]", bone.bind_local_matrix[12], bone.bind_local_matrix[13], bone.bind_local_matrix[14], bone.bind_local_matrix[15]);
-                CLOG_DEBUG(&LOG, "      inv_bind:   [%.4f, %.4f, %.4f, %.4f]", bone.inverse_bind_matrix[0], bone.inverse_bind_matrix[1], bone.inverse_bind_matrix[2], bone.inverse_bind_matrix[3]);
-                CLOG_DEBUG(&LOG, "                  [%.4f, %.4f, %.4f, %.4f]", bone.inverse_bind_matrix[4], bone.inverse_bind_matrix[5], bone.inverse_bind_matrix[6], bone.inverse_bind_matrix[7]);
-                CLOG_DEBUG(&LOG, "                  [%.4f, %.4f, %.4f, %.4f]", bone.inverse_bind_matrix[8], bone.inverse_bind_matrix[9], bone.inverse_bind_matrix[10], bone.inverse_bind_matrix[11]);
-                CLOG_DEBUG(&LOG, "                  [%.4f, %.4f, %.4f, %.4f]", bone.inverse_bind_matrix[12], bone.inverse_bind_matrix[13], bone.inverse_bind_matrix[14], bone.inverse_bind_matrix[15]);
-            }
-        }
-
-        // Animations
-        CLOG_DEBUG(&LOG, "ANIMATIONS (%ld):", data.animations.size());
-        for (const auto& anim : data.animations)
-        {
-            CLOG_DEBUG(&LOG, "  animation: %s (armature=%s, %ld channels)", anim.name.c_str(), anim.armature_name.c_str(), anim.channels.size());
-            for (size_t i = 0; i < anim.channels.size(); i++)
-            {
-                const auto& channel  = anim.channels[i];
-                const char* type_str = channel.channel_type == anim_channel_type_t::LOCATION ? "location" : (channel.channel_type == anim_channel_type_t::ROTATION ? "rotation" : "scale");
-                CLOG_DEBUG(&LOG, "    channel[%zu]: bone=%u, type=%s, keyframes=%ld", i, channel.bone_index, type_str, channel.keyframe_times.size());
-                // Print first and last keyframe for debugging
-                if (!channel.keyframe_times.is_empty())
-                {
-                    const auto& first_val = channel.keyframe_values.first();
-                    const auto& last_val  = channel.keyframe_values.last();
-                    CLOG_DEBUG(&LOG, "      first (t=%.3f): [%.4f, %.4f, %.4f, %.4f]", channel.keyframe_times.first(), first_val[0], first_val[1], first_val[2], first_val[3]);
-                    CLOG_DEBUG(&LOG, "      last  (t=%.3f): [%.4f, %.4f, %.4f, %.4f]", channel.keyframe_times.last(), last_val[0], last_val[1], last_val[2], last_val[3]);
-                }
-            }
-        }
-
-        CLOG_DEBUG(&LOG, "=== END DATA DUMP ===");
+        dbg_data(data);
     }
 
     // ===============================================================================================
