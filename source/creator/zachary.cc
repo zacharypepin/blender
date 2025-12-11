@@ -7,11 +7,13 @@
 #include <functional>
 #include <map>
 #include <optional>
-#include <queue>
 #include <set>
 #include <unordered_map>
 #include <variant>
 #include "BLI_listbase.h"
+#include "BLI_map.hh"
+#include "BLI_set.hh"
+#include "BLI_stack.hh"
 #include "BLI_vector.hh"
 #include "BLI_listbase_wrapper.hh"
 #include "BLI_math_euler.hh"
@@ -34,13 +36,17 @@
 #include "DNA_packedFile_types.h"
 #include "DNA_scene_types.h"
 
+#include "BKE_armature.hh"
 #include "BKE_attribute.hh"
 #include "BKE_collection.hh"
 #include "BKE_context.hh"
+#include "BKE_deform.hh"
 #include "BKE_image.hh"
 #include "BKE_main.hh"
 #include "BKE_material.hh"
 #include "BKE_mesh.hh"
+#include "BKE_node.hh"
+#include "BKE_node_runtime.hh"
 
 #include "ANIM_action.hh"
 #include "ANIM_action_iterators.hh"
@@ -1159,58 +1165,28 @@ static void recurs_flatten_node_tree(bNodeTree* tree, const std::string& prefix,
 {
     if (tree == nullptr) return;
 
-    // Build reroute resolution map: traces through reroute chains to find actual source
-    // Maps reroute node name -> (source node, source socket)
-    std::map<std::string, std::pair<bNode*, bNodeSocket*>> reroute_sources;
-    {
-        // First, find what each reroute's input is directly connected to
-        std::map<std::string, std::pair<bNode*, bNodeSocket*>> direct_sources;
-        for (bNodeLink* link : blender::ListBaseWrapper<bNodeLink>(tree->links))
-        {
-            if (!link->fromnode || !link->tonode || !link->fromsock || !link->tosock) continue;
-            if (blender::StringRef(link->tonode->idname) == "NodeReroute")
-            {
-                direct_sources[link->tonode->name] = {link->fromnode, link->fromsock};
-            }
-        }
+    // Ensure topology cache is available for logically_linked_sockets()
+    tree->ensure_topology_cache();
 
-        // Resolve chains: trace through reroutes to find the actual source
-        for (auto& [reroute_name, source] : direct_sources)
-        {
-            bNode* current_node       = source.first;
-            bNodeSocket* current_sock = source.second;
-            while (current_node && blender::StringRef(current_node->idname) == "NodeReroute")
-            {
-                auto it = direct_sources.find(current_node->name);
-                if (it == direct_sources.end()) break;
-                current_node = it->second.first;
-                current_sock = it->second.second;
-            }
-            reroute_sources[reroute_name] = {current_node, current_sock};
-        }
-    }
-
-    // Helper to resolve actual source (handles reroutes)
-    auto resolve_source = [&](bNode* from_node, bNodeSocket* from_sock) -> std::pair<bNode*, bNodeSocket*>
+    // Helper to get the logical source for an input socket (resolves through reroutes automatically)
+    auto get_logical_source = [](const bNodeSocket* input_sock) -> std::pair<const bNode*, const bNodeSocket*>
     {
-        if (blender::StringRef(from_node->idname) == "NodeReroute")
+        blender::Span<const bNodeSocket*> sources = input_sock->logically_linked_sockets();
+        if (sources.is_empty())
         {
-            auto it = reroute_sources.find(from_node->name);
-            if (it != reroute_sources.end())
-            {
-                return it->second;
-            }
+            return {nullptr, nullptr};
         }
-        return {from_node, from_sock};
+        const bNodeSocket* source_sock = sources[0];
+        return {&source_sock->owner_node(), source_sock};
     };
 
     // First pass: identify group nodes, build their io mappings, collect internal links for resolving group io
     std::map<std::string, bNodeTree*> group_trees;
     std::map<std::string, std::map<std::string, socket_endpoint_t>> group_input_maps;
     std::map<std::string, std::map<std::string, socket_endpoint_t>> group_output_maps;
-    for (bNode* node : blender::ListBaseWrapper<bNode>(tree->nodes))
+    for (bNode* node : tree->group_nodes())
     {
-        if (blender::StringRef(node->idname) != "ShaderNodeGroup" || node->id == nullptr)
+        if (node->id == nullptr)
         {
             continue;
         }
@@ -1218,57 +1194,55 @@ static void recurs_flatten_node_tree(bNodeTree* tree, const std::string& prefix,
         bNodeTree* group_tree   = (bNodeTree*)node->id;
         group_trees[node->name] = group_tree;
 
-        for (bNodeLink* link : blender::ListBaseWrapper<bNodeLink>(group_tree->links))
+        // Ensure topology cache for the group tree to use all_links()
+        group_tree->ensure_topology_cache();
+        for (const bNodeLink* link : group_tree->all_links())
         {
             if (!link->fromnode || !link->tonode || !link->fromsock || !link->tosock) continue;
-            if (blender::StringRef(link->fromnode->idname) == "NodeGroupInput") group_input_maps[node->name][link->fromsock->identifier] = {prefix + node->name + "." + link->tonode->name, link->tosock->identifier};
-            if (blender::StringRef(link->tonode->idname) == "NodeGroupOutput") group_output_maps[node->name][link->tosock->identifier] = {prefix + node->name + "." + link->fromnode->name, link->fromsock->identifier};
+            if (link->fromnode->is_group_input()) group_input_maps[node->name][link->fromsock->identifier] = {prefix + node->name + "." + link->tonode->name, link->tosock->identifier};
+            if (link->tonode->is_group_output()) group_output_maps[node->name][link->tosock->identifier] = {prefix + node->name + "." + link->fromnode->name, link->fromsock->identifier};
         }
     }
 
-    // Second pass: process all nodes
-    for (bNode* node : blender::ListBaseWrapper<bNode>(tree->nodes))
+    // Second pass: process all nodes in topological order (upstream nodes first)
+    // This ensures group output mappings are available when processing downstream groups
+    for (bNode* node : tree->toposort_left_to_right())
     {
-        if (blender::StringRef(node->idname) == "NodeGroupInput" || blender::StringRef(node->idname) == "NodeGroupOutput" || blender::StringRef(node->idname) == "NodeReroute")
+        if (node->is_group_input() || node->is_group_output() || node->is_reroute() || node->is_frame())
         {
             continue;
         }
-        else if (blender::StringRef(node->idname) == "ShaderNodeGroup" && node->id != nullptr)
+        else if (node->is_group() && node->id != nullptr)
         {
             std::map<std::string, socket_endpoint_t> nested_input_mappings;
-            for (bNodeLink* link : blender::ListBaseWrapper<bNodeLink>(tree->links))
+            for (bNodeSocket* input_sock : node->input_sockets())
             {
-                if (link->tonode != node || !link->fromnode || !link->fromsock || !link->tosock)
-                {
-                    continue;
-                }
-
-                // Resolve through reroutes
-                auto [resolved_node, resolved_sock] = resolve_source(link->fromnode, link->fromsock);
+                // Use topology cache to get logical source (handles reroutes automatically)
+                auto [resolved_node, resolved_sock] = get_logical_source(input_sock);
                 if (!resolved_node) continue;
 
-                if (blender::StringRef(resolved_node->idname) == "ShaderNodeGroup")
+                if (resolved_node->is_group())
                 {
                     auto& src_output_map = group_output_maps[resolved_node->name];
                     auto it              = src_output_map.find(resolved_sock->identifier);
                     if (it != src_output_map.end())
                     {
-                        nested_input_mappings[link->tosock->identifier] = it->second;
+                        nested_input_mappings[input_sock->identifier] = it->second;
                         continue;
                     }
                 }
-                else if (blender::StringRef(resolved_node->idname) == "NodeGroupInput")
+                else if (resolved_node->is_group_input())
                 {
                     auto it = input_mappings.find(resolved_sock->identifier);
                     if (it != input_mappings.end())
                     {
-                        nested_input_mappings[link->tosock->identifier] = it->second;
+                        nested_input_mappings[input_sock->identifier] = it->second;
                         continue;
                     }
                 }
 
-                std::string from_node_name                      = prefix + resolved_node->name;
-                nested_input_mappings[link->tosock->identifier] = {from_node_name, resolved_sock->identifier};
+                std::string from_node_name                    = prefix + resolved_node->name;
+                nested_input_mappings[input_sock->identifier] = {from_node_name, std::string(resolved_sock->identifier)};
             }
 
             // Recursively flatten the group
@@ -1282,45 +1256,48 @@ static void recurs_flatten_node_tree(bNodeTree* tree, const std::string& prefix,
         }
         else
         {
-            auto extract_default_value = [](bNodeSocket* socket) -> std::optional<socket_default_value_t>
+            auto extract_default_value = [](const bNodeSocket* socket) -> std::optional<socket_default_value_t>
             {
                 if (socket->default_value == nullptr) return std::nullopt;
 
-                if (blender::StringRef(socket->idname).startswith("NodeSocketFloat"))
+                // Use socket->type enum instead of string comparisons
+                switch (socket->type)
                 {
-                    auto* val = static_cast<bNodeSocketValueFloat*>(socket->default_value);
-                    return socket_value_float_t{val->value};
+                    case SOCK_FLOAT:
+                    {
+                        const auto* val = socket->default_value_typed<bNodeSocketValueFloat>();
+                        return socket_value_float_t{val->value};
+                    }
+                    case SOCK_INT:
+                    {
+                        const auto* val = socket->default_value_typed<bNodeSocketValueInt>();
+                        return socket_value_int_t{val->value};
+                    }
+                    case SOCK_BOOLEAN:
+                    {
+                        const auto* val = socket->default_value_typed<bNodeSocketValueBoolean>();
+                        return socket_value_bool_t{val->value != 0};
+                    }
+                    case SOCK_VECTOR:
+                    {
+                        const auto* val = socket->default_value_typed<bNodeSocketValueVector>();
+                        return socket_value_vector_t{blender::float3(val->value[0], val->value[1], val->value[2])};
+                    }
+                    case SOCK_RGBA:
+                    {
+                        const auto* val = socket->default_value_typed<bNodeSocketValueRGBA>();
+                        return socket_value_rgba_t{blender::float4(val->value[0], val->value[1], val->value[2], val->value[3])};
+                    }
+                    default: return std::nullopt;
                 }
-                else if (blender::StringRef(socket->idname).startswith("NodeSocketInt"))
-                {
-                    auto* val = static_cast<bNodeSocketValueInt*>(socket->default_value);
-                    return socket_value_int_t{val->value};
-                }
-                else if (blender::StringRef(socket->idname) == "NodeSocketBool")
-                {
-                    auto* val = static_cast<bNodeSocketValueBoolean*>(socket->default_value);
-                    return socket_value_bool_t{val->value != 0};
-                }
-                else if (blender::StringRef(socket->idname).startswith("NodeSocketVector"))
-                {
-                    auto* val = static_cast<bNodeSocketValueVector*>(socket->default_value);
-                    return socket_value_vector_t{blender::float3(val->value[0], val->value[1], val->value[2])};
-                }
-                else if (blender::StringRef(socket->idname) == "NodeSocketColor")
-                {
-                    auto* val = static_cast<bNodeSocketValueRGBA*>(socket->default_value);
-                    return socket_value_rgba_t{blender::float4(val->value[0], val->value[1], val->value[2], val->value[3])};
-                }
-
-                return std::nullopt;
             };
 
             shader_node_t node_data;
             node_data.name   = prefix + node->name;
             node_data.idname = node->idname;
 
-            // Input sockets
-            for (bNodeSocket* socket : blender::ListBaseWrapper<bNodeSocket>(node->inputs))
+            // Input sockets - use input_sockets() instead of ListBaseWrapper
+            for (bNodeSocket* socket : node->input_sockets())
             {
                 shader_node_socket_t socket_data;
                 socket_data.identifier    = socket->identifier;
@@ -1329,8 +1306,8 @@ static void recurs_flatten_node_tree(bNodeTree* tree, const std::string& prefix,
                 node_data.inputs.append(socket_data);
             }
 
-            // Output sockets
-            for (bNodeSocket* socket : blender::ListBaseWrapper<bNodeSocket>(node->outputs))
+            // Output sockets - use output_sockets() instead of ListBaseWrapper
+            for (bNodeSocket* socket : node->output_sockets())
             {
                 shader_node_socket_t socket_data;
                 socket_data.identifier    = socket->identifier;
@@ -1347,21 +1324,21 @@ static void recurs_flatten_node_tree(bNodeTree* tree, const std::string& prefix,
             auto add_uv_map_prop = [&](const char* id, const std::string& val) { node_data.props.append({id, socket_value_uv_map_t{val}}); };
             auto add_rgba_prop   = [&](const char* id, float r, float g, float b, float a) { node_data.props.append({id, socket_value_rgba_t{blender::float4(r, g, b, a)}}); };
 
-            if (blender::StringRef(node->idname) == "ShaderNodeUVMap")
+            if (node->is_type("ShaderNodeUVMap"))
             {
                 NodeShaderUVMap* data = (NodeShaderUVMap*)node->storage;
                 if (data) add_uv_map_prop("uv_map", data->uv_map);
             }
-            else if (blender::StringRef(node->idname) == "ShaderNodeMath")
+            else if (node->is_type("ShaderNodeMath"))
             {
                 add_int_prop("operation", node->custom1);
                 add_bool_prop("use_clamp", node->custom2 != 0);
             }
-            else if (blender::StringRef(node->idname) == "ShaderNodeVectorMath")
+            else if (node->is_type("ShaderNodeVectorMath"))
             {
                 add_int_prop("operation", node->custom1);
             }
-            else if (blender::StringRef(node->idname) == "ShaderNodeMix")
+            else if (node->is_type("ShaderNodeMix"))
             {
                 NodeShaderMix* data = (NodeShaderMix*)node->storage;
                 if (data)
@@ -1373,12 +1350,12 @@ static void recurs_flatten_node_tree(bNodeTree* tree, const std::string& prefix,
                     add_int_prop("factor_mode", data->factor_mode);
                 }
             }
-            else if (blender::StringRef(node->idname) == "ShaderNodeSeparateColor" || blender::StringRef(node->idname) == "ShaderNodeCombineColor")
+            else if (node->is_type("ShaderNodeSeparateColor") || node->is_type("ShaderNodeCombineColor"))
             {
                 NodeCombSepColor* data = (NodeCombSepColor*)node->storage;
                 if (data) add_int_prop("mode", data->mode);
             }
-            else if (blender::StringRef(node->idname) == "ShaderNodeTexNoise")
+            else if (node->is_type("ShaderNodeTexNoise"))
             {
                 NodeTexNoise* data = (NodeTexNoise*)node->storage;
                 if (data)
@@ -1388,7 +1365,7 @@ static void recurs_flatten_node_tree(bNodeTree* tree, const std::string& prefix,
                     add_bool_prop("normalize", data->normalize != 0);
                 }
             }
-            else if (blender::StringRef(node->idname) == "ShaderNodeTexImage")
+            else if (node->is_type("ShaderNodeTexImage"))
             {
                 if (node->id != nullptr)
                 {
@@ -1403,7 +1380,7 @@ static void recurs_flatten_node_tree(bNodeTree* tree, const std::string& prefix,
                     add_int_prop("extension", data->extension);
                 }
             }
-            else if (blender::StringRef(node->idname) == "ShaderNodeValToRGB")
+            else if (node->is_type("ShaderNodeValToRGB"))
             {
                 ColorBand* coba = (ColorBand*)node->storage;
                 if (coba)
@@ -1417,25 +1394,25 @@ static void recurs_flatten_node_tree(bNodeTree* tree, const std::string& prefix,
                     }
                 }
             }
-            else if (blender::StringRef(node->idname) == "ShaderNodeAmbientOcclusion")
+            else if (node->is_type("ShaderNodeAmbientOcclusion"))
             {
                 add_int_prop("samples", node->custom1);
                 add_bool_prop("inside", (node->custom2 & SHD_AO_INSIDE) != 0);
                 add_bool_prop("only_local", (node->custom2 & SHD_AO_LOCAL) != 0);
             }
-            else if (blender::StringRef(node->idname) == "ShaderNodeBump")
+            else if (node->is_type("ShaderNodeBump"))
             {
                 add_bool_prop("invert", node->custom1 != 0);
             }
-            else if (blender::StringRef(node->idname) == "ShaderNodeClamp")
+            else if (node->is_type("ShaderNodeClamp"))
             {
                 add_int_prop("clamp_type", node->custom1);
             }
-            else if (blender::StringRef(node->idname) == "ShaderNodeDisplacement")
+            else if (node->is_type("ShaderNodeDisplacement"))
             {
                 add_int_prop("space", node->custom1);
             }
-            else if (blender::StringRef(node->idname) == "ShaderNodeMapRange")
+            else if (node->is_type("ShaderNodeMapRange"))
             {
                 NodeMapRange* data = (NodeMapRange*)node->storage;
                 if (data)
@@ -1445,11 +1422,11 @@ static void recurs_flatten_node_tree(bNodeTree* tree, const std::string& prefix,
                     add_bool_prop("clamp", data->clamp != 0);
                 }
             }
-            else if (blender::StringRef(node->idname) == "ShaderNodeMapping")
+            else if (node->is_type("ShaderNodeMapping"))
             {
                 add_int_prop("vector_type", node->custom1);
             }
-            else if (blender::StringRef(node->idname) == "ShaderNodeNormalMap")
+            else if (node->is_type("ShaderNodeNormalMap"))
             {
                 NodeShaderNormalMap* data = (NodeShaderNormalMap*)node->storage;
                 if (data)
@@ -1458,7 +1435,7 @@ static void recurs_flatten_node_tree(bNodeTree* tree, const std::string& prefix,
                     add_uv_map_prop("uv_map", data->uv_map);
                 }
             }
-            else if (blender::StringRef(node->idname) == "ShaderNodeTangent")
+            else if (node->is_type("ShaderNodeTangent"))
             {
                 NodeShaderTangent* data = (NodeShaderTangent*)node->storage;
                 if (data)
@@ -1468,7 +1445,7 @@ static void recurs_flatten_node_tree(bNodeTree* tree, const std::string& prefix,
                     add_uv_map_prop("uv_map", data->uv_map);
                 }
             }
-            else if (blender::StringRef(node->idname) == "ShaderNodeTexBrick")
+            else if (node->is_type("ShaderNodeTexBrick"))
             {
                 NodeTexBrick* data = (NodeTexBrick*)node->storage;
                 if (data)
@@ -1479,7 +1456,7 @@ static void recurs_flatten_node_tree(bNodeTree* tree, const std::string& prefix,
                     add_int_prop("squash_frequency", data->squash_freq);
                 }
             }
-            else if (blender::StringRef(node->idname) == "ShaderNodeTexEnvironment")
+            else if (node->is_type("ShaderNodeTexEnvironment"))
             {
                 if (node->id != nullptr)
                 {
@@ -1493,7 +1470,7 @@ static void recurs_flatten_node_tree(bNodeTree* tree, const std::string& prefix,
                     add_int_prop("projection", data->projection);
                 }
             }
-            else if (blender::StringRef(node->idname) == "ShaderNodeTexGabor")
+            else if (node->is_type("ShaderNodeTexGabor"))
             {
                 NodeTexGabor* data = (NodeTexGabor*)node->storage;
                 if (data)
@@ -1501,7 +1478,7 @@ static void recurs_flatten_node_tree(bNodeTree* tree, const std::string& prefix,
                     add_int_prop("gabor_type", data->type);
                 }
             }
-            else if (blender::StringRef(node->idname) == "ShaderNodeTexGradient")
+            else if (node->is_type("ShaderNodeTexGradient"))
             {
                 NodeTexGradient* data = (NodeTexGradient*)node->storage;
                 if (data)
@@ -1509,7 +1486,7 @@ static void recurs_flatten_node_tree(bNodeTree* tree, const std::string& prefix,
                     add_int_prop("gradient_type", data->gradient_type);
                 }
             }
-            else if (blender::StringRef(node->idname) == "ShaderNodeTexMagic")
+            else if (node->is_type("ShaderNodeTexMagic"))
             {
                 NodeTexMagic* data = (NodeTexMagic*)node->storage;
                 if (data)
@@ -1517,7 +1494,7 @@ static void recurs_flatten_node_tree(bNodeTree* tree, const std::string& prefix,
                     add_int_prop("turbulence_depth", data->depth);
                 }
             }
-            else if (blender::StringRef(node->idname) == "ShaderNodeTexVoronoi")
+            else if (node->is_type("ShaderNodeTexVoronoi"))
             {
                 NodeTexVoronoi* data = (NodeTexVoronoi*)node->storage;
                 if (data)
@@ -1527,7 +1504,7 @@ static void recurs_flatten_node_tree(bNodeTree* tree, const std::string& prefix,
                     add_int_prop("distance", data->distance);
                 }
             }
-            else if (blender::StringRef(node->idname) == "ShaderNodeTexWave")
+            else if (node->is_type("ShaderNodeTexWave"))
             {
                 NodeTexWave* data = (NodeTexWave*)node->storage;
                 if (data)
@@ -1538,20 +1515,20 @@ static void recurs_flatten_node_tree(bNodeTree* tree, const std::string& prefix,
                     add_int_prop("wave_profile", data->wave_profile);
                 }
             }
-            else if (blender::StringRef(node->idname) == "ShaderNodeTexWhiteNoise")
+            else if (node->is_type("ShaderNodeTexWhiteNoise"))
             {
                 add_int_prop("noise_dimensions", node->custom1);
             }
-            else if (blender::StringRef(node->idname) == "ShaderNodeVectorDisplacement")
+            else if (node->is_type("ShaderNodeVectorDisplacement"))
             {
                 add_int_prop("space", node->custom1);
             }
-            else if (blender::StringRef(node->idname) == "ShaderNodeVectorRotate")
+            else if (node->is_type("ShaderNodeVectorRotate"))
             {
                 add_int_prop("rotation_type", node->custom1);
                 add_bool_prop("invert", node->custom2 != 0);
             }
-            else if (blender::StringRef(node->idname) == "ShaderNodeVectorTransform")
+            else if (node->is_type("ShaderNodeVectorTransform"))
             {
                 NodeShaderVectTransform* data = (NodeShaderVectTransform*)node->storage;
                 if (data)
@@ -1566,24 +1543,20 @@ static void recurs_flatten_node_tree(bNodeTree* tree, const std::string& prefix,
         }
     }
 
-    // Third pass: process links and resolve group boundaries
-    for (bNodeLink* link : blender::ListBaseWrapper<bNodeLink>(tree->links))
+    // Third pass: process links and resolve group boundaries using topology cache
+
+    // Handle group output node - build output_mappings
+    if (bNode* group_output = tree->group_output_node())
     {
-        if (!link->fromnode || !link->tonode || !link->fromsock || !link->tosock) continue;
-
-        if (blender::StringRef(link->fromnode->idname) == "NodeGroupInput") continue;
-
-        if (blender::StringRef(link->tonode->idname) == "NodeReroute") continue;
-
-        auto [resolved_node, resolved_sock] = resolve_source(link->fromnode, link->fromsock);
-        if (!resolved_node) continue;
-
-        if (blender::StringRef(link->tonode->idname) == "NodeGroupOutput")
+        for (bNodeSocket* input_sock : group_output->input_sockets())
         {
-            std::string from_node_name = prefix + resolved_node->name;
-            std::string from_socket    = resolved_sock->identifier;
+            auto [resolved_node, resolved_sock] = get_logical_source(input_sock);
+            if (!resolved_node) continue;
 
-            if (blender::StringRef(resolved_node->idname) == "ShaderNodeGroup")
+            std::string from_node_name = prefix + resolved_node->name;
+            std::string from_socket    = std::string(resolved_sock->identifier);
+
+            if (resolved_node->is_group())
             {
                 auto& src_output_map = group_output_maps[resolved_node->name];
                 auto it              = src_output_map.find(resolved_sock->identifier);
@@ -1593,7 +1566,7 @@ static void recurs_flatten_node_tree(bNodeTree* tree, const std::string& prefix,
                     from_socket    = it->second.socket_id;
                 }
             }
-            else if (blender::StringRef(resolved_node->idname) == "NodeGroupInput")
+            else if (resolved_node->is_group_input())
             {
                 // Handle GroupInput -> Reroute -> GroupOutput (pass-through)
                 auto it = input_mappings.find(resolved_sock->identifier);
@@ -1604,70 +1577,62 @@ static void recurs_flatten_node_tree(bNodeTree* tree, const std::string& prefix,
                 }
             }
 
-            output_mappings[link->tosock->identifier] = {from_node_name, from_socket};
-            continue;
+            output_mappings[input_sock->identifier] = {from_node_name, from_socket};
         }
-
-        if (blender::StringRef(link->tonode->idname) == "ShaderNodeGroup") continue;
-        if (blender::StringRef(resolved_node->idname) == "ShaderNodeGroup")
-        {
-            auto& src_output_map = group_output_maps[resolved_node->name];
-            auto it              = src_output_map.find(resolved_sock->identifier);
-            if (it != src_output_map.end())
-            {
-                shader_link_t link_data;
-                link_data.from_node   = it->second.node_name;
-                link_data.from_socket = it->second.socket_id;
-                link_data.to_node     = prefix + link->tonode->name;
-                link_data.to_socket   = link->tosock->identifier;
-                material_data.links.append(link_data);
-            }
-            continue;
-        }
-
-        // Handle case where reroute resolves back to GroupInput (GroupInput -> Reroute -> Node)
-        if (blender::StringRef(resolved_node->idname) == "NodeGroupInput")
-        {
-            auto it = input_mappings.find(resolved_sock->identifier);
-            if (it != input_mappings.end())
-            {
-                shader_link_t link_data;
-                link_data.from_node   = it->second.node_name;
-                link_data.from_socket = it->second.socket_id;
-                link_data.to_node     = prefix + link->tonode->name;
-                link_data.to_socket   = link->tosock->identifier;
-                material_data.links.append(link_data);
-            }
-            continue;
-        }
-
-        shader_link_t link_data;
-        link_data.from_node   = prefix + resolved_node->name;
-        link_data.from_socket = resolved_sock->identifier;
-        link_data.to_node     = prefix + link->tonode->name;
-        link_data.to_socket   = link->tosock->identifier;
-        material_data.links.append(link_data);
     }
 
-    // Fourth pass: add links from input mappings for nodes that read from GroupInput
-    for (bNodeLink* link : blender::ListBaseWrapper<bNodeLink>(tree->links))
+    // Process regular nodes and build links
+    for (bNode* node : tree->all_nodes())
     {
-        if (!link->fromnode || !link->tonode || !link->fromsock || !link->tosock) continue;
-
-        if (blender::StringRef(link->tonode->idname) == "NodeReroute") continue;
-
-        if (blender::StringRef(link->fromnode->idname) == "NodeGroupInput" && blender::StringRef(link->tonode->idname) != "NodeGroupOutput" && blender::StringRef(link->tonode->idname) != "ShaderNodeGroup")
+        // Skip reroutes, group input/output, groups, and frames - they're handled separately or are organizational
+        if (node->is_reroute() || node->is_group_input() || node->is_group_output() || node->is_group() || node->is_frame())
         {
-            auto it = input_mappings.find(link->fromsock->identifier);
-            if (it != input_mappings.end())
+            continue;
+        }
+
+        // For regular nodes, create links from their logical sources
+        for (bNodeSocket* input_sock : node->input_sockets())
+        {
+            auto [resolved_node, resolved_sock] = get_logical_source(input_sock);
+            if (!resolved_node) continue;
+
+            if (resolved_node->is_group())
             {
-                shader_link_t link_data;
-                link_data.from_node   = it->second.node_name;
-                link_data.from_socket = it->second.socket_id;
-                link_data.to_node     = prefix + link->tonode->name;
-                link_data.to_socket   = link->tosock->identifier;
-                material_data.links.append(link_data);
+                auto& src_output_map = group_output_maps[resolved_node->name];
+                auto it              = src_output_map.find(resolved_sock->identifier);
+                if (it != src_output_map.end())
+                {
+                    shader_link_t link_data;
+                    link_data.from_node   = it->second.node_name;
+                    link_data.from_socket = it->second.socket_id;
+                    link_data.to_node     = prefix + node->name;
+                    link_data.to_socket   = input_sock->identifier;
+                    material_data.links.append(link_data);
+                }
+                continue;
             }
+
+            if (resolved_node->is_group_input())
+            {
+                auto it = input_mappings.find(resolved_sock->identifier);
+                if (it != input_mappings.end())
+                {
+                    shader_link_t link_data;
+                    link_data.from_node   = it->second.node_name;
+                    link_data.from_socket = it->second.socket_id;
+                    link_data.to_node     = prefix + node->name;
+                    link_data.to_socket   = input_sock->identifier;
+                    material_data.links.append(link_data);
+                }
+                continue;
+            }
+
+            shader_link_t link_data;
+            link_data.from_node   = prefix + resolved_node->name;
+            link_data.from_socket = std::string(resolved_sock->identifier);
+            link_data.to_node     = prefix + node->name;
+            link_data.to_socket   = input_sock->identifier;
+            material_data.links.append(link_data);
         }
     }
 }
@@ -1745,42 +1710,40 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
             }
 
             // Build reverse adjacency: for each node, which nodes feed into it
-            std::map<std::string, blender::Vector<std::string>> reverse_adj;
+            blender::Map<std::string, blender::Vector<std::string>> reverse_adj;
+            for (const auto& link : material_data.links)
             {
-                for (const auto& link : material_data.links)
-                {
-                    reverse_adj[link.to_node].append(link.from_node);
-                }
+                reverse_adj.lookup_or_add_default(link.to_node).append(link.from_node);
             }
 
             // BFS backwards from supported Principled BSDF sockets only
-            std::set<std::string> reachable_nodes;
+            blender::Set<std::string> reachable_nodes;
             {
-                reachable_nodes.insert(principled_node_name.value());
+                reachable_nodes.add(principled_node_name.value());
 
-                blender::Vector<std::string> queue;
+                blender::Stack<std::string> stack;
                 for (const auto& link : material_data.links)
                 {
                     if (link.to_node == principled_node_name.value() && supported_sockets.count(link.to_socket))
                     {
-                        if (reachable_nodes.find(link.from_node) == reachable_nodes.end())
+                        if (reachable_nodes.add(link.from_node))
                         {
-                            reachable_nodes.insert(link.from_node);
-                            queue.append(link.from_node);
+                            stack.push(link.from_node);
                         }
                     }
                 }
 
-                while (!queue.is_empty())
+                while (!stack.is_empty())
                 {
-                    std::string current = queue.last();
-                    queue.remove_last();
-                    for (const auto& pred : reverse_adj[current])
+                    std::string current = stack.pop();
+                    if (const blender::Vector<std::string>* preds = reverse_adj.lookup_ptr(current))
                     {
-                        if (reachable_nodes.find(pred) == reachable_nodes.end())
+                        for (const auto& pred : *preds)
                         {
-                            reachable_nodes.insert(pred);
-                            queue.append(pred);
+                            if (reachable_nodes.add(pred))
+                            {
+                                stack.push(pred);
+                            }
                         }
                     }
                 }
@@ -1788,40 +1751,36 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
 
             // Filter nodes to only those reachable
             blender::Vector<shader_node_t> filtered_nodes;
+            for (const auto& node : material_data.nodes)
             {
-                for (auto& node : material_data.nodes)
+                if (reachable_nodes.contains(node.name))
                 {
-                    if (reachable_nodes.count(node.name))
-                    {
-                        filtered_nodes.append(std::move(node));
-                    }
+                    filtered_nodes.append(node);
                 }
             }
 
             // Build set of actual node names from filtered_nodes
-            std::set<std::string> filtered_node_names;
+            blender::Set<std::string> filtered_node_names;
             for (const auto& node : filtered_nodes)
             {
-                filtered_node_names.insert(node.name);
+                filtered_node_names.add(node.name);
             }
 
             // Filter links to only those between actual filtered nodes, and only supported sockets for Principled BSDF
             blender::Vector<shader_link_t> filtered_links;
+            for (const auto& link : material_data.links)
             {
-                for (auto& link : material_data.links)
+                // Must exist in actual filtered nodes (not just reachable_nodes which is from link names)
+                if (!filtered_node_names.contains(link.from_node) || !filtered_node_names.contains(link.to_node))
                 {
-                    // Must exist in actual filtered nodes (not just reachable_nodes which is from link names)
-                    if (!filtered_node_names.count(link.from_node) || !filtered_node_names.count(link.to_node))
-                    {
-                        continue;
-                    }
-                    // For links going to Principled BSDF, only keep supported sockets
-                    if (link.to_node == principled_node_name.value() && !supported_sockets.count(link.to_socket))
-                    {
-                        continue;
-                    }
-                    filtered_links.append(std::move(link));
+                    continue;
                 }
+                // For links going to Principled BSDF, only keep supported sockets
+                if (link.to_node == principled_node_name.value() && !supported_sockets.count(link.to_socket))
+                {
+                    continue;
+                }
+                filtered_links.append(link);
             }
 
             bool is_supported = true;
@@ -1838,25 +1797,25 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
 
                 if (is_supported)
                 {
-                    std::map<std::string, std::string> node_name_to_idname;
+                    blender::Map<std::string, std::string> node_name_to_idname;
                     for (const auto& node : filtered_nodes)
                     {
-                        node_name_to_idname[node.name] = node.idname;
+                        node_name_to_idname.add(node.name, node.idname);
                     }
 
                     for (const auto& link : filtered_links)
                     {
-                        auto node_it = node_name_to_idname.find(link.from_node);
-                        if (node_it == node_name_to_idname.end())
+                        const std::string* idname_ptr = node_name_to_idname.lookup_ptr(link.from_node);
+                        if (!idname_ptr)
                         {
                             // This should never happen - filtered_links should only contain links between filtered_nodes
                             CLOG_FATAL(&LOG, "BUG: Link from_node '%s' not in filtered_nodes for material %s", link.from_node.c_str(), mat->id.name);
                         }
 
-                        const std::string& idname     = node_it->second;
+                        const std::string& idname     = *idname_ptr;
                         const auto& supported_outputs = supported_node_outputs.at(idname);
 
-                        if (!supported_outputs.count(link.from_socket))
+                        if (supported_outputs.find(link.from_socket) == supported_outputs.end())
                         {
                             CLOG_INFO(&LOG, "Skipping material %s (unsupported output socket: %s.%s)", mat->id.name, idname.c_str(), link.from_socket.c_str());
                             is_supported = false;
@@ -1872,109 +1831,110 @@ void zachary_main(const struct bContext* C, const char* bb_archive_output_dir)
             }
 
             // Filter sockets to only supported ones
+            for (auto& node : filtered_nodes)
             {
-                for (auto& node : filtered_nodes)
+                // Filter node output sockets
+                auto it = supported_node_outputs.find(node.idname);
+                if (it != supported_node_outputs.end())
                 {
-                    // Filter node output sockets
-                    auto it = supported_node_outputs.find(node.idname);
-                    if (it != supported_node_outputs.end())
+                    const auto& allowed_outputs = it->second;
+                    blender::Vector<shader_node_socket_t> new_outputs;
+                    for (const auto& socket : node.outputs)
                     {
-                        const auto& allowed_outputs = it->second;
-                        blender::Vector<shader_node_socket_t> new_outputs;
-                        for (auto& socket : node.outputs)
+                        if (allowed_outputs.find(socket.identifier) != allowed_outputs.end())
                         {
-                            if (allowed_outputs.count(socket.identifier))
-                            {
-                                new_outputs.append(std::move(socket));
-                            }
+                            new_outputs.append(socket);
                         }
-                        node.outputs = std::move(new_outputs);
                     }
+                    node.outputs = new_outputs;
+                }
 
-                    // Filter Principled BSDF input sockets
-                    if (node.idname == "ShaderNodeBsdfPrincipled")
+                // Filter Principled BSDF input sockets
+                if (node.idname == "ShaderNodeBsdfPrincipled")
+                {
+                    blender::Vector<shader_node_socket_t> new_inputs;
+                    for (const auto& socket : node.inputs)
                     {
-                        blender::Vector<shader_node_socket_t> new_inputs;
-                        for (auto& socket : node.inputs)
+                        if (supported_sockets.find(socket.identifier) != supported_sockets.end())
                         {
-                            if (supported_sockets.count(socket.identifier))
-                            {
-                                new_inputs.append(std::move(socket));
-                            }
+                            new_inputs.append(socket);
                         }
-                        node.inputs = std::move(new_inputs);
                     }
+                    node.inputs = new_inputs;
                 }
             }
 
             // Topological sort: dependencies before dependents, Principled BSDF at the end
             {
                 // Build adjacency list and in-degree count
-                std::unordered_map<std::string, blender::Vector<std::string>> dependents;
-                std::unordered_map<std::string, int> in_degree;
+                blender::Map<std::string, blender::Vector<std::string>> dependents;
+                blender::Map<std::string, int> in_degree;
 
                 // Initialize all nodes with in_degree 0
                 for (const auto& node : filtered_nodes)
                 {
-                    in_degree[node.name] = 0;
+                    in_degree.add(node.name, 0);
                 }
 
                 // Build graph from links
                 for (const auto& link : filtered_links)
                 {
-                    dependents[link.from_node].append(link.to_node);
-                    in_degree[link.to_node]++;
+                    dependents.lookup_or_add_default(link.from_node).append(link.to_node);
+                    in_degree.lookup(link.to_node)++;
                 }
 
                 // Kahn's algorithm
-                std::queue<std::string> queue;
-                for (const auto& [name, degree] : in_degree)
+                blender::Stack<std::string> stack;
+                for (const auto item : in_degree.items())
                 {
-                    if (degree == 0)
+                    if (item.value == 0)
                     {
-                        queue.push(name);
+                        stack.push(item.key);
                     }
                 }
 
                 blender::Vector<std::string> sorted_order;
-                while (!queue.empty())
+                while (!stack.is_empty())
                 {
-                    std::string current = queue.front();
-                    queue.pop();
+                    std::string current = stack.pop();
                     sorted_order.append(current);
 
-                    for (const auto& dependent : dependents[current])
+                    if (const blender::Vector<std::string>* deps = dependents.lookup_ptr(current))
                     {
-                        in_degree[dependent]--;
-                        if (in_degree[dependent] == 0)
+                        for (const auto& dependent : *deps)
                         {
-                            queue.push(dependent);
+                            int& deg = in_degree.lookup(dependent);
+                            deg--;
+                            if (deg == 0)
+                            {
+                                stack.push(dependent);
+                            }
                         }
                     }
                 }
 
                 // Reorder filtered_nodes according to sorted_order
-                std::unordered_map<std::string, shader_node_t> node_map;
-                for (auto& node : filtered_nodes)
+                blender::Map<std::string, shader_node_t> node_map;
+                for (const auto& node : filtered_nodes)
                 {
-                    node_map[node.name] = std::move(node);
+                    node_map.add(node.name, node);
                 }
 
                 filtered_nodes.clear();
                 for (const auto& name : sorted_order)
                 {
-                    auto it = node_map.find(name);
-                    if (it != node_map.end())
+                    const shader_node_t* node_ptr = node_map.lookup_ptr(name);
+                    if (node_ptr)
                     {
-                        filtered_nodes.append(std::move(it->second));
+                        filtered_nodes.append(*node_ptr);
                     }
                 }
             }
 
-            material_data.nodes                = std::move(filtered_nodes);
-            material_data.links                = std::move(filtered_links);
+            material_data.nodes                = filtered_nodes;
+            material_data.links                = filtered_links;
 
-            data.materials[material_data.name] = std::move(material_data);
+            data.materials[material_data.name] = material_data;
         }
     }
 
